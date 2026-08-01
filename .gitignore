@@ -1,0 +1,18 @@
+# Build artifacts
+*.zip
+*.so
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Git
+*.orig
+
+# Temporary files
+*.tmp
+*.log

@@ -1,0 +1,73 @@
+name: Build Stealth Ultimate
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      trigger:
+        description: 'Trigger build'
+        required: false
+        default: 'build'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      
+      - name: Cache NDK
+        uses: actions/cache@v4
+        with:
+          path: android-ndk-r27b
+          key: ndk-r27b-${{ runner.os }}
+          restore-keys: ndk-r27b-${{ runner.os }}
+      
+      - name: Install NDK r27b
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          rm -rf android-ndk-r27b
+          wget -q https://dl.google.com/android/repository/android-ndk-r27b-linux.zip
+          unzip -q -o android-ndk-r27b-linux.zip
+          echo "NDK_HOME=$GITHUB_WORKSPACE/android-ndk-r27b" >> $GITHUB_ENV
+          echo "NDK=$GITHUB_WORKSPACE/android-ndk-r27b" >> $GITHUB_ENV
+        timeout-minutes: 10
+      
+      - name: Build .so files
+        run: |
+          cd $GITHUB_WORKSPACE/sources
+          export NDK_HOME=$NDK_HOME
+          export CC=clang
+          bash compile.sh
+      
+      - name: Sync build artifacts
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/build/zygisk
+          cp $GITHUB_WORKSPACE/sources/zygisk/*.so $GITHUB_WORKSPACE/build/zygisk/
+          cp -r $GITHUB_WORKSPACE/sources/shell/* $GITHUB_WORKSPACE/build/
+          cp -r $GITHUB_WORKSPACE/sources/shell/common/* $GITHUB_WORKSPACE/build/common/
+          ls -lh $GITHUB_WORKSPACE/build/zygisk/
+      
+      - name: Package module
+        run: |
+          cd $GITHUB_WORKSPACE/build
+          zip -r $GITHUB_WORKSPACE/stealth_ultimate.zip .
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: stealth-ultimate
+          path: stealth_ultimate.zip
+          retention-days: 30
+      
+      - name: Upload to release
+        if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: stealth_ultimate.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
