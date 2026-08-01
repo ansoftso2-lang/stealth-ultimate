@@ -40,21 +40,33 @@
 
 #define LOG_PATH "/data/adb/stealth_ultimate/stealth.log"
 #define LOG_BUF_SIZE 1024
-static int g_logging = 0;
+static volatile int g_logging = 0;
 
 static void log_write(const char *fmt, ...) {
     if (g_logging) return;
     g_logging = 1;
     char buf[LOG_BUF_SIZE];
-    int fd = openat(AT_FDCWD, LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (fd < 0) { g_logging = 0; return; }
     va_list ap;
     va_start(ap, fmt);
     int n = vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    if (n > 0) write(fd, buf, n);
-    write(fd, "\n", 1);
-    close(fd);
+    if (n <= 0) { g_logging = 0; return; }
+    if (n > (int)sizeof(buf)) n = (int)sizeof(buf);
+    /* Use raw syscalls to bypass our own openat/close/write hooks
+       (LOG_PATH is under /data/adb which we hide from target apps). */
+#ifdef __NR_openat
+    int fd = (int)syscall(__NR_openat, AT_FDCWD, LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0644);
+#else
+    int fd = -1;
+#endif
+    if (fd < 0) { g_logging = 0; return; }
+#ifdef __NR_write
+    syscall(__NR_write, fd, buf, n);
+    syscall(__NR_write, fd, "\n", 1);
+#endif
+#ifdef __NR_close
+    syscall(__NR_close, fd);
+#endif
     g_logging = 0;
 }
 
