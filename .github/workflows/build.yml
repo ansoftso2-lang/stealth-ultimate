@@ -41,6 +41,7 @@ jobs:
           export NDK_HOME=$NDK_HOME
           export CC=clang
           bash compile.sh
+          ls -lh $GITHUB_WORKSPACE/sources/zygisk/*.so
       
       - name: Sync build artifacts
         run: |

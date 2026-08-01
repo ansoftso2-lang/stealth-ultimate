@@ -349,6 +349,14 @@ static ssize_t (*real_getline)(char **, size_t *, FILE *) = NULL;
 static long (*real_syscall)(long, ...) = NULL;
 static ssize_t (*real_pread64)(int, void *, size_t, off64_t) = NULL;
 static unsigned long (*real_getauxval)(unsigned long) = NULL;
+static pid_t (*real_fork)(void) = NULL;
+static pid_t (*real_vfork)(void) = NULL;
+static int (*real_clone)(int (*)(void *), void *, int, ...) = NULL;
+static int (*real_execve)(const char *, char *const[], char *const[]) = NULL;
+static int (*real_execveat)(int, const char *, char *const[], char *const[], int) = NULL;
+static int (*real_posix_spawn)(pid_t *, const char *, void *, void *, char *const[], char *const[]) = NULL;
+static pid_t (*real_getpid)(void) = NULL;
+static pid_t (*real_getppid)(void) = NULL;
 
 static void init_reals(void) {
     if (g_in_init) return;
@@ -382,6 +390,14 @@ static void init_reals(void) {
     real_syscall = dlsym(RTLD_NEXT, "syscall");
     real_pread64 = dlsym(RTLD_NEXT, "pread64");
     real_getauxval = dlsym(RTLD_NEXT, "getauxval");
+    real_fork = dlsym(RTLD_NEXT, "fork");
+    real_vfork = dlsym(RTLD_NEXT, "vfork");
+    real_clone = dlsym(RTLD_NEXT, "clone");
+    real_execve = dlsym(RTLD_NEXT, "execve");
+    real_execveat = dlsym(RTLD_NEXT, "execveat");
+    real_posix_spawn = dlsym(RTLD_NEXT, "posix_spawn");
+    real_getpid = dlsym(RTLD_NEXT, "getpid");
+    real_getppid = dlsym(RTLD_NEXT, "getppid");
     if (!real_openat) { failed++; LOGE("init_reals: openat=NULL"); }
     if (!real_open) { failed++; LOGE("init_reals: open=NULL"); }
     if (!real_read) { failed++; LOGE("init_reals: read=NULL"); }
@@ -994,6 +1010,59 @@ static int is_hidden_path(const char *p) {
     if (strstr(p, "/data/local/tmp/magisk_pressure")) return 1;
     if (strstr(p, "/data/local/tmp/magisk_humidity")) return 1;
     if (strstr(p, "/data/local/tmp/magisk_temperature")) return 1;
+    /* Magisk addon.d installer */
+    if (strstr(p, "/system/addon.d/99-magisk.sh")||strstr(p, "/system/addon.d/99-magisk")) return 1;
+    if (strstr(p, "/system/addon.d/99-magisk.img")) return 1;
+    /* Zygisk traces */
+    if (strstr(p, "/data/adb/zygisk")) return 1;
+    if (strstr(p, "/data/adb/modules/zygisk")) return 1;
+    if (strstr(p, "zygisk")) return 1;
+    if (strstr(p, "Zygisk")) return 1;
+    /* Bootloader / verified boot traces */
+    if (strstr(p, "/sys/fs/selinux/policyvers")) return 1;
+    if (strstr(p, "/sys/fs/selinux/avc")) return 1;
+    if (strstr(p, "/sys/fs/selinux/initial_contexts")) return 1;
+    if (strstr(p, "/sys/fs/selinux/class")) return 1;
+    if (strstr(p, "/sys/fs/selinux/mls")) return 1;
+    if (strstr(p, "/sys/fs/selinux/booleans")) return 1;
+    if (strstr(p, "/proc/1/attr/current")) return 1;
+    if (strstr(p, "/sys/kernel/debug")) return 1;
+    if (strstr(p, "/sys/fs/debug")) return 1;
+    /* Mount error traces */
+    if (strstr(p, "/proc/mounts")) return 1;
+    if (strstr(p, "/proc/mountinfo")) return 1;
+    if (strstr(p, "/proc/mountstats")) return 1;
+    if (strstr(p, "/proc/filesystems")) return 1;
+    /* Injection / tracing traces */
+    if (strstr(p, "/sys/kernel/debug/tracing")) return 1;
+    if (strstr(p, "/sys/kernel/tracing")) return 1;
+    if (strstr(p, "/sys/kernel/trace")) return 1;
+    if (strstr(p, "/sys/kernel/debug/kmemleak")) return 1;
+    if (strstr(p, "/sys/kernel/debug/kprobes")) return 1;
+    if (strstr(p, "/sys/kernel/debug/uprobes")) return 1;
+    if (strstr(p, "/sys/kernel/debug/jit")) return 1;
+    if (strstr(p, "/sys/kernel/debug/gc")) return 1;
+    if (strstr(p, "/sys/kernel/debug/dynamic_debug")) return 1;
+    if (strstr(p, "/sys/kernel/debug/bootstat")) return 1;
+    if (strstr(p, "/sys/kernel/debug/bluetooth")) return 1;
+    if (strstr(p, "/sys/kernel/debug/wifi")) return 1;
+    if (strstr(p, "/sys/kernel/debug/ion")) return 1;
+    if (strstr(p, "/sys/kernel/debug/gpio")) return 1;
+    if (strstr(p, "/sys/kernel/debug/clk")) return 1;
+    if (strstr(p, "/sys/kernel/debug/regulator")) return 1;
+    if (strstr(p, "/sys/kernel/debug/pm")) return 1;
+    if (strstr(p, "/sys/kernel/debug/suspend")) return 1;
+    if (strstr(p, "/sys/kernel/debug/thermal")) return 1;
+    if (strstr(p, "/sys/kernel/debug/power")) return 1;
+    if (strstr(p, "/sys/kernel/debug/battery")) return 1;
+    if (strstr(p, "/sys/kernel/debug/cpu")) return 1;
+    if (strstr(p, "/sys/kernel/debug/memory")) return 1;
+    if (strstr(p, "/sys/kernel/debug/block")) return 1;
+    if (strstr(p, "/sys/kernel/debug/net")) return 1;
+    if (strstr(p, "/sys/kernel/debug/usb")) return 1;
+    if (strstr(p, "/sys/kernel/debug/input")) return 1;
+    if (strstr(p, "/sys/kernel/debug/graphics")) return 1;
+    if (strstr(p, "/sys/kernel/debug/mtp")) return 1;
     return 0;
 }
 
@@ -1125,6 +1194,22 @@ static const char *get_spoof(const char *name) {
     if (!strcmp(name, "ro.build.characteristics")) return s_characteristics;
     if (!strcmp(name, "ro.product.cpu.abilist32")) return s_abilist32;
     if (!strcmp(name, "ro.product.cpu.abilist64")) return "arm64-v8a";
+
+    /* Additional Play Integrity properties */
+    if (!strcmp(name, "ro.product.first_api_level")) return s_release;
+    if (!strcmp(name, "ro.vendor.product.first_api_level")) return s_release;
+    if (!strcmp(name, "ro.product.locale")) return s_locale;
+    if (!strcmp(name, "ro.product.timezone")) return s_timezone;
+    if (!strcmp(name, "ro.sf.lcd_density")) return s_lcd_density;
+    if (!strcmp(name, "ro.sf.hw")) return s_sf_hw;
+    if (!strcmp(name, "ro.hardware.chipname")) return s_hw;
+    if (!strcmp(name, "ro.boot.serialno")) return s_serial;
+    if (!strcmp(name, "ro.boot.hardware")) return s_hw;
+    if (!strcmp(name, "ro.boot.product")) return s_product;
+    if (!strcmp(name, "ro.product.cpu.abi")) return s_abi;
+    if (!strcmp(name, "ro.product.cpu.abilist")) return s_abilist;
+    if (!strcmp(name, "ro.treble.enabled")) return "1";
+    if (!strcmp(name, "ro.vndk.version")) return s_sdk;
 
     return NULL;
 }
@@ -1507,6 +1592,67 @@ unsigned long getauxval(unsigned long type) {
     return real_getauxval(type);
 }
 
+/* Subprocess hooks — ensure hidden state persists across fork/clone/exec */
+pid_t fork_hook(void) {
+    if (!real_fork) init_reals();
+    LOGI("fork: pid=%d", getpid());
+    return real_fork ? real_fork() : -1;
+}
+
+int clone_hook(int (*fn)(void *), void *child_stack, int flags, ...) {
+    if (!real_clone) init_reals();
+    LOGI("clone: flags=%d", flags);
+    va_list ap; va_start(ap, flags); void *arg = va_arg(ap, void *); va_end(ap);
+    return real_clone ? real_clone(fn, child_stack, flags, arg) : -1;
+}
+
+int execve_hook(const char *pathname, char *const argv[], char *const envp[]) {
+    if (!real_execve) init_reals();
+    if (g_hidden && pathname && is_hidden_path(pathname)) {
+        LOGE("execve: BLOCKED hidden path=%s", pathname);
+        errno = ENOENT;
+        return -1;
+    }
+    LOGI("execve: path=%s", pathname ? pathname : "(null)");
+    return real_execve ? real_execve(pathname, argv, envp) : -1;
+}
+
+int execveat_hook(int dirfd, const char *pathname, char *const argv[], char *const envp[], int flags) {
+    if (!real_execveat) init_reals();
+    if (g_hidden && pathname && is_hidden_path(pathname)) {
+        LOGE("execveat: BLOCKED hidden path=%s", pathname);
+        errno = ENOENT;
+        return -1;
+    }
+    LOGI("execveat: path=%s", pathname ? pathname : "(null)");
+    return real_execveat ? real_execveat(dirfd, pathname, argv, envp, flags) : -1;
+}
+
+int posix_spawn_hook(pid_t *pid, const char *path, void *actions, void *attr, char *const argv[], char *const envp[]) {
+    if (!real_posix_spawn) init_reals();
+    if (g_hidden && path && is_hidden_path(path)) {
+        LOGE("posix_spawn: BLOCKED hidden path=%s", path);
+        errno = ENOENT;
+        return -1;
+    }
+    LOGI("posix_spawn: path=%s", path ? path : "(null)");
+    return real_posix_spawn ? real_posix_spawn(pid, path, actions, attr, argv, envp) : -1;
+}
+
+pid_t getpid_hook(void) {
+    if (!real_getpid) init_reals();
+    pid_t pid = real_getpid ? real_getpid() : getpid();
+    LOGD("getpid: %d", pid);
+    return pid;
+}
+
+pid_t getppid_hook(void) {
+    if (!real_getppid) init_reals();
+    pid_t ppid = real_getppid ? real_getppid() : getppid();
+    LOGD("getppid: %d", ppid);
+    return ppid;
+}
+
 /* __system_property_get — FIXED: 2 params + property blacklist */
 int __system_property_get(const char *name, char *value) {
     if (!real_prop_get) init_reals(); if (!real_prop_get) return 0;
@@ -1731,7 +1877,7 @@ struct hook_entry {
     void *hook;
 };
 
-#define HOOK_COUNT 28
+#define HOOK_COUNT 40
 static struct hook_entry g_hook_table[HOOK_COUNT];
 static int g_hook_table_built = 0;
 
@@ -1767,6 +1913,14 @@ static void build_hook_table(void) {
     g_hook_table[i++] = (struct hook_entry){"syscall", (void*)syscall};
     g_hook_table[i++] = (struct hook_entry){"pread64", (void*)pread64};
     g_hook_table[i++] = (struct hook_entry){"getauxval", (void*)getauxval};
+    g_hook_table[i++] = (struct hook_entry){"fork", (void*)fork_hook};
+    g_hook_table[i++] = (struct hook_entry){"vfork", (void*)fork_hook};
+    g_hook_table[i++] = (struct hook_entry){"clone", (void*)clone_hook};
+    g_hook_table[i++] = (struct hook_entry){"execve", (void*)execve_hook};
+    g_hook_table[i++] = (struct hook_entry){"execveat", (void*)execveat_hook};
+    g_hook_table[i++] = (struct hook_entry){"posix_spawn", (void*)posix_spawn_hook};
+    g_hook_table[i++] = (struct hook_entry){"getpid", (void*)getpid_hook};
+    g_hook_table[i++] = (struct hook_entry){"getppid", (void*)getppid_hook};
 }
 
 static void *find_hook(const char *name) {
@@ -1947,6 +2101,14 @@ static void install_zygisk_plt_hooks(void) {
     g_api->pltHookRegister(0, 0, "syscall", (void*)syscall, (void**)&real_syscall);
     g_api->pltHookRegister(0, 0, "pread64", (void*)pread64, (void**)&real_pread64);
     g_api->pltHookRegister(0, 0, "getauxval", (void*)getauxval, (void**)&real_getauxval);
+    g_api->pltHookRegister(0, 0, "fork", (void*)fork_hook, (void**)&real_fork);
+    g_api->pltHookRegister(0, 0, "vfork", (void*)fork_hook, (void**)&real_fork);
+    g_api->pltHookRegister(0, 0, "clone", (void*)clone_hook, (void**)&real_clone);
+    g_api->pltHookRegister(0, 0, "execve", (void*)execve_hook, (void**)&real_execve);
+    g_api->pltHookRegister(0, 0, "execveat", (void*)execveat_hook, (void**)&real_execveat);
+    g_api->pltHookRegister(0, 0, "posix_spawn", (void*)posix_spawn_hook, (void**)&real_posix_spawn);
+    g_api->pltHookRegister(0, 0, "getpid", (void*)getpid_hook, (void**)&real_getpid);
+    g_api->pltHookRegister(0, 0, "getppid", (void*)getppid_hook, (void**)&real_getppid);
 
     g_api->pltHookCommit();
     LOGI("install_zygisk_plt_hooks: commit done");
