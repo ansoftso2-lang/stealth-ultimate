@@ -1949,6 +1949,7 @@ static void install_zygisk_plt_hooks(void) {
     g_api->pltHookRegister(0, 0, "getauxval", (void*)getauxval, (void**)&real_getauxval);
 
     g_api->pltHookCommit();
+    LOGI("install_zygisk_plt_hooks: commit done");
 }
 
 static void install_got_hooks(void) {
@@ -1961,7 +1962,7 @@ static void install_got_hooks(void) {
         LOGI("install_got_hooks: using Zygisk PLT hooks");
         install_zygisk_plt_hooks();
     } else {
-        LOGI("install_got_hooks: Zygisk PLT not available, using dl_iterate fallback");
+        LOGE("install_got_hooks: Zygisk PLT not available");
     }
 
     /* Fallback: manual GOT patching */
@@ -1988,7 +1989,16 @@ static void c_preAppSpecialize(void *impl, void *args) {
     }
     LOGI("preAppSpecialize: flags=%u", g_zygisk_flags);
 }
-static void c_postAppSpecialize(void *impl, const void *args) { (void)impl; (void)args; determine_hidden(); if (g_hidden) install_got_hooks(); }
+static void c_postAppSpecialize(void *impl, const void *args) {
+    (void)impl; (void)args;
+    LOGI("postAppSpecialize: start hidden=%d", g_hidden);
+    determine_hidden();
+    LOGI("postAppSpecialize: after determine_hidden hidden=%d", g_hidden);
+    if (g_hidden) {
+        LOGI("postAppSpecialize: installing hooks");
+        install_got_hooks();
+    }
+}
 static void c_preServerSpecialize(void *impl, void *args) { (void)impl; (void)args; }
 static void c_postServerSpecialize(void *impl, const void *args) { (void)impl; (void)args; }
 
