@@ -38,7 +38,7 @@
 #include <elf.h>
 #include <sys/mman.h>
 
-#define LOG_PATH "/data/adb/stealth_ultimate/stealth.log"
+#define LOG_PATH "/data/local/tmp/stealth_ultimate.log"
 #define LOG_BUF_SIZE 1024
 static volatile int g_logging = 0;
 
@@ -859,7 +859,7 @@ static int is_hidden_path(const char *p) {
     if (strstr(p, "/proc/self/cmdline")) return 0;
 
     /* Magisk */
-    if (strstr(p, "/sbin/.magisk")||strstr(p, "/data/adb/magisk")||strstr(p, "/data/adb/modules")||strstr(p, "/data/adb/modules_update")||strstr(p, "/data/adb/zygisk")||strstr(p, "/data/adb/.magisk")||strstr(p, "/data/adb/stealth")||strstr(p, "/data/adb/stealth_ultimate")||strstr(p, "/data/adb/post-fs-data.d")||strstr(p, "/data/adb/service.d")||strstr(p, "/data/adb/.core")||strstr(p, "/debug_ramdisk")||strstr(p, "/sbin/magisk")||strstr(p, "/data/adb/magisk.db")||strstr(p, "com.topjohnwu.magisk")||strstr(p, "io.github.vvb2060.magisk")||strstr(p, "/sbin/magiskd")||strstr(p, "/sbin/magiskinit")) return 1;
+    if (strstr(p, "/sbin/.magisk")||strstr(p, "/data/adb/magisk")||strstr(p, "/data/adb/modules")||strstr(p, "/data/adb/modules_update")||strstr(p, "/data/adb/zygisk")||strstr(p, "/data/adb/.magisk")||strstr(p, "/data/adb/stealth")||strstr(p, "/data/adb/stealth_ultimate")||strstr(p, "/data/adb/post-fs-data.d")||strstr(p, "/data/adb/service.d")||strstr(p, "/data/adb/.core")||strstr(p, "/debug_ramdisk")||strstr(p, "/sbin/magisk")||strstr(p, "/data/adb/magisk.db")||strstr(p, "com.topjohnwu.magisk")||strstr(p, "io.github.vvb2060.magisk")||strstr(p, "/sbin/magiskd")||strstr(p, "/sbin/magiskinit")||strstr(p, "magisk_addon")||strstr(p, "magisk_pfsd")||strstr(p, "magisk_busybox")||strstr(p, "magiskexec")) return 1;
     /* KernelSU */
     if (strstr(p, "/data/adb/ksu")||strstr(p, "/data/adb/ksud")||strstr(p, "/debug_ramdisk/ksu")||strstr(p, "io.github.rifsxd.kernelsu")||strstr(p, "me.weishu.kernelsu")) return 1;
     /* APatch */
@@ -1856,6 +1856,15 @@ long syscall(long number, ...) {
 #endif
 #ifdef SYS_newfstatat
         if (number == SYS_newfstatat) { if (is_hidden_path((const char *)a2)) { g_in_hook = 0; errno = ENOENT; return -1; } }
+#endif
+#ifdef __NR_statx
+        if (number == __NR_statx) { if (is_hidden_path((const char *)a2)) { g_in_hook = 0; errno = ENOENT; return -1; } }
+#endif
+#ifdef __NR_openat2
+        if (number == __NR_openat2) { const char *path = (const char *)a2; if (is_hidden_path(path)) { g_in_hook = 0; errno = ENOENT; return -1; } long res = raw_syscall(number, a1, a2, a3, a4, a5, a6); if (res >= 0 && path) { enum ProcFdType t = classify_proc_path(path); if (t != FD_TYPE_NONE) add_tracked_fd((int)res, t); } g_in_hook = 0; return res; }
+#endif
+#ifdef __NR_faccessat2
+        if (number == __NR_faccessat2) { if (is_hidden_path((const char *)a2)) { g_in_hook = 0; errno = ENOENT; return -1; } }
 #endif
 #ifdef SYS_readlink
         if (number == SYS_readlink) { if (is_hidden_path((const char *)a1)) { g_in_hook = 0; errno = ENOENT; return -1; } }

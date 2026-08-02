@@ -61,6 +61,12 @@ if command -v magisk >/dev/null 2>&1; then
     # Clear existing denylist
     magisk --denylist clear 2>/dev/null || true
 
+    # Make sure denylist enforcement is ENABLED.
+    # Without this, `--denylist add` populates the list but Zygisk still
+    # injects into every process => our hooks never install in target apps.
+    magisk --denylist enable 2>/dev/null || true
+    log "denylist enforcement enabled"
+
     # Build list of root UIDs to skip
     ROOT_UID_LIST=""
     if [ -f "$DATA_DIR/root_uids.txt" ]; then

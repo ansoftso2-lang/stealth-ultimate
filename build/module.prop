@@ -1,7 +1,7 @@
 id=stealth_ultimate
 name=Stealth Ultimate
-version=v1.3
-versionCode=130
+version=v1.4
+versionCode=140
 author=stealth
 description=Zygisk module. Hides root, Magisk, KSU, APatch, Zygisk, LSPosed, Frida, Xposed, Riru, Shamiko, SELinux, busybox from apps. Device spoofing with Play Integrity support. Kernel, CPU, mounts, maps, environ, net/unix, SELinux context, getauxval spoofing. Ptrace blocking. Auto-detects apps with root access and exempts them. No GUI — everything enabled by default.
 minMagisk=24000
