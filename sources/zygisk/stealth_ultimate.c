@@ -369,6 +369,10 @@ static int (*real_execveat)(int, const char *, char *const[], char *const[], int
 static int (*real_posix_spawn)(pid_t *, const char *, void *, void *, char *const[], char *const[]) = NULL;
 static pid_t (*real_getpid)(void) = NULL;
 static pid_t (*real_getppid)(void) = NULL;
+static void *(*real_dlsym)(void *, const char *) = NULL;
+static int (*real_dladdr)(const void *, void *) = NULL;
+static void *(*real_dlvsym)(void *, const char *) = NULL;
+static void *(*real_dlopen)(const char *, int) = NULL;
 
 static void init_reals(void) {
     if (g_in_init) return;
@@ -410,6 +414,10 @@ static void init_reals(void) {
     real_posix_spawn = dlsym(RTLD_NEXT, "posix_spawn");
     real_getpid = dlsym(RTLD_NEXT, "getpid");
     real_getppid = dlsym(RTLD_NEXT, "getppid");
+    real_dlsym = dlsym(RTLD_NEXT, "dlsym");
+    real_dladdr = dlsym(RTLD_NEXT, "dladdr");
+    real_dlvsym = dlsym(RTLD_NEXT, "dlvsym");
+    real_dlopen = dlsym(RTLD_NEXT, "dlopen");
     if (!real_openat) { failed++; LOGE("init_reals: openat=NULL"); }
     if (!real_open) { failed++; LOGE("init_reals: open=NULL"); }
     if (!real_read) { failed++; LOGE("init_reals: read=NULL"); }
@@ -426,7 +434,8 @@ enum ProcFdType {
     FD_TYPE_CPUINFO, FD_TYPE_VERSION, FD_TYPE_MOUNTS, FD_TYPE_SELINUX_ENFORCE,
     FD_TYPE_UNIX, FD_TYPE_ATTR_CURRENT, FD_TYPE_ATTR_PREV, FD_TYPE_CMDLINE,
     FD_TYPE_CWD, FD_TYPE_EXE, FD_TYPE_ROOT, FD_TYPE_FD, FD_TYPE_NET_TCP,
-    FD_TYPE_NET_TCP6, FD_TYPE_NET_UDP, FD_TYPE_NET_UDP6, FD_TYPE_STAT, FD_TYPE_IO, FD_TYPE_LIMITS
+    FD_TYPE_NET_TCP6, FD_TYPE_NET_UDP, FD_TYPE_NET_UDP6, FD_TYPE_STAT, FD_TYPE_IO, FD_TYPE_LIMITS,
+    FD_TYPE_SMAPS, FD_TYPE_SMAPS_ROLLUP
 };
 
 struct TrackedFd { int fd; enum ProcFdType type; };
@@ -584,7 +593,7 @@ static int should_hide_mounts_line(const char *line) {
 
 static int should_hide_unix_line(const char *line) {
     if (!line) return 0;
-    if (strstr(line, "magisk")||strstr(line, "@magisk")||strstr(line, "zygisk")||strstr(line, "ksu")||strstr(line, "apatch")||strstr(line, "stealth")||strstr(line, "/data/adb")) return 1;
+    if (strstr(line, "magisk")||strstr(line, "@magisk")||strstr(line, "zygisk")||strstr(line, "ksu")||strstr(line, "apatch")||strstr(line, "stealth")||strstr(line, "/data/adb")||strstr(line, "MAGISKTP")||strstr(line, "/sbin/.magisk")||strstr(line, "/debug_ramdisk")||strstr(line, "frida")||strstr(line, "linjector")||strstr(line, "gum-js-loop")||strstr(line, "xposed")||strstr(line, "lspd")||strstr(line, "riru")||strstr(line, "shamiko")||strstr(line, "xposed_bridge")||strstr(line, "edxp")||strstr(line, "pine")) return 1;
     return 0;
 }
 
@@ -599,6 +608,44 @@ static void filter_maps_buffer(char *buf, ssize_t *n) {
         if (!eol) break; line = eol + 1;
     }
     if (off < (size_t)*n) { memcpy(buf, tmp, off); *n = (ssize_t)off; }
+}
+
+/* smaps: each region begins with an address line (hex digits).
+   If that header line matches a hidden pattern, drop the WHOLE block
+   (header + detail fields) until the next address line — keeps smaps
+   → maps line-count ratio consistent for consistency-based detectors. */
+static int is_smaps_header(const char *line, size_t len) {
+    if (!line || len < 12) return 0;
+    char c = line[0];
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return 0;
+    const char *sp = memchr(line, '-', len);
+    if (!sp) return 0;
+    for (const char *p = line; p < sp; p++) {
+        char h = *p;
+        if (!((h >= '0' && h <= '9') || (h >= 'a' && h <= 'f'))) return 0;
+    }
+    return 1;
+}
+
+static void filter_smaps_buffer(char *buf, ssize_t *n) {
+    if (!buf || *n <= 0) return;
+    char tmp[65536]; size_t off = 0, cap = sizeof(tmp);
+    char *line = buf, *end = buf + *n;
+    int drop = 0;
+    while (line < end) {
+        char *eol = memchr(line, '\n', end - line);
+        size_t len = eol ? (size_t)(eol - line) : (size_t)(end - line);
+        int hdr = is_smaps_header(line, len);
+        if (hdr) drop = should_hide_maps_line(line);
+        if (!drop) { if (off + len + 1 <= cap) { memcpy(tmp + off, line, len); off += len; if (eol) tmp[off++] = '\n'; } }
+        if (!eol) break; line = eol + 1;
+    }
+    if (off < (size_t)*n) { memcpy(buf, tmp, off); *n = (ssize_t)off; }
+}
+
+static void filter_smaps_rollup_buffer(char *buf, ssize_t *n) {
+    /* rollup has no region blocks; just strip any line mentioning hidden libs */
+    filter_maps_buffer(buf, n);
 }
 
 static void filter_status_buffer(char *buf, ssize_t *n) {
@@ -797,6 +844,8 @@ static void filter_proc_buffer(enum ProcFdType type, char *buf, ssize_t *n) {
     if (!buf || *n <= 0) return;
     switch (type) {
         case FD_TYPE_MAPS: if (cfg_hide_maps) filter_maps_buffer(buf, n); break;
+        case FD_TYPE_SMAPS: if (cfg_hide_maps) filter_smaps_buffer(buf, n); break;
+        case FD_TYPE_SMAPS_ROLLUP: if (cfg_hide_maps) filter_smaps_rollup_buffer(buf, n); break;
         case FD_TYPE_STATUS: if (cfg_hide_status) filter_status_buffer(buf, n); break;
         case FD_TYPE_ENVIRON: if (cfg_hide_environ) filter_environ_buffer(buf, n); break;
         case FD_TYPE_CPUINFO: if (cfg_spoof_cpu) filter_cpuinfo_buffer(buf, n); break;
@@ -826,6 +875,8 @@ static enum ProcFdType classify_proc_path(const char *path) {
     if (!path) return FD_TYPE_NONE;
     if (strstr(path, "/proc/")) {
         if (strstr(path, "/maps")) return FD_TYPE_MAPS;
+        if (strstr(path, "/smaps_rollup")) return FD_TYPE_SMAPS_ROLLUP;
+        if (strstr(path, "/smaps")) return FD_TYPE_SMAPS;
         if (strstr(path, "/status")) return FD_TYPE_STATUS;
         if (strstr(path, "/environ")) return FD_TYPE_ENVIRON;
         if (strstr(path, "/cpuinfo")) return FD_TYPE_CPUINFO;
@@ -1665,6 +1716,58 @@ pid_t getppid_hook(void) {
     return ppid;
 }
 
+/* Symbols/strings that reveal root/hook frameworks when resolved via dlsym */
+static int is_hidden_symbol(const char *name) {
+    if (!name) return 0;
+    if (strstr(name, "zygisk_module_entry")) return 1;
+    if (strstr(name, "zygisk")) return 1;
+    if (strstr(name, "lspd_setExtendsHookTable") || strstr(name, "lspd_context")) return 1;
+    if (strstr(name, "xposed_handle") || strstr(name, "xposedInit") || strstr(name, "edxp_hook") || strstr(name, "edxp_init")) return 1;
+    if (strstr(name, "riru_get_module_info") || strstr(name, "riru_init") || strstr(name, "riru_api_version")) return 1;
+    if (strstr(name, "frida_agent_main") || strstr(name, "gum_init_embedded") || strstr(name, "gum_interceptor_obtain") || strstr(name, "gum_memory_scan") || strstr(name, "gum_script_manager_new")) return 1;
+    if (strstr(name, "kuu_hook_func") || strstr(name, "ksu_init") || strstr(name, "apd_init")) return 1;
+    if (strstr(name, "shamiko") || strstr(name, "magiskhide") || strstr(name, "resetprop")) return 1;
+    if (strstr(name, "substrate_main") || strstr(name, "MSGetImageByName")) return 1;
+    if (strstr(name, "stealth_active") || strstr(name, "stealth_hidden")) return 1;
+    return 0;
+}
+
+void *dlsym_hook(void *handle, const char *name) {
+    if (!g_in_hook && g_hidden && name) {
+        g_in_hook = 1;
+        if (is_hidden_symbol(name)) {
+            LOGD("dlsym: HIDDEN %s", name);
+            g_in_hook = 0;
+            return NULL;
+        }
+        g_in_hook = 0;
+    }
+    if (!real_dlsym) init_reals();
+    return real_dlsym ? real_dlsym(handle, name) : dlsym(handle, name);
+}
+
+void *dlvsym_hook(void *handle, const char *name) {
+    if (!g_in_hook && g_hidden && name) {
+        g_in_hook = 1;
+        if (is_hidden_symbol(name)) { g_in_hook = 0; return NULL; }
+        g_in_hook = 0;
+    }
+    if (!real_dlvsym) init_reals();
+    return real_dlvsym ? real_dlvsym(handle, name) : dlvsym(handle, name);
+}
+
+int dladdr_hook(const void *addr, void *info) {
+    if (!real_dladdr) init_reals();
+    return real_dladdr ? real_dladdr(addr, info) : dladdr(addr, info);
+}
+
+void *dlopen_hook(const char *name, int flags) {
+    void *h = NULL;
+    if (!real_dlopen) init_reals();
+    h = real_dlopen ? real_dlopen(name, flags) : dlopen(name, flags);
+    return h;
+}
+
 /* __system_property_get — FIXED: 2 params + property blacklist */
 int __system_property_get(const char *name, char *value) {
     if (!real_prop_get) init_reals(); if (!real_prop_get) return 0;
@@ -1830,41 +1933,58 @@ long syscall(long number, ...) {
     if (!real_syscall) return -1;
     if (!g_in_hook && g_hidden) {
         g_in_hook = 1;
+
+        /* Universal hidden-path guards – catch ANY syscall with a path argument
+           so detectors cannot use unknown/obscure syscalls to bypass hooks.
+           ARG1 paths:  open, access, stat, stat64, lstat, lstat64, chmod, chown,
+                        truncate, getxattr, listxattr, setxattr, removexattr,
+                        readlink, execve, uselib, swapon, swapoff, chroot, mount, umount */
+        const char *p_a1 = (const char *)a1;
+        /* ARG2 paths: openat, faccessat, faccessat2, fstatat, fstatat64,
+                        newfstatat, statx, openat2, readlinkat,
+                        fchmodat, fchownat, utimensat, name_to_handle_at,
+                        linkat, symlinkat, unlinkat, mkdirat, mknodat,
+                        execveat, renameat2 */
+        const char *p_a2 = (const char *)a2;
+
+        if (p_a1 && is_hidden_path(p_a1)) { g_in_hook = 0; errno = ENOENT; return -1; }
+        if (p_a2 && is_hidden_path(p_a2)) { g_in_hook = 0; errno = ENOENT; return -1; }
+
 #ifdef SYS_openat
-        if (number == SYS_openat) { const char *path = (const char *)a2; if (is_hidden_path(path)) { g_in_hook = 0; errno = ENOENT; return -1; } long res = raw_syscall(number, a1, a2, a3, a4, a5, a6); if (res >= 0 && path) { enum ProcFdType t = classify_proc_path(path); if (t != FD_TYPE_NONE) add_tracked_fd((int)res, t); } g_in_hook = 0; return res; }
+        if (number == SYS_openat) { const char *path = (const char *)a2; long res = raw_syscall(number, a1, a2, a3, a4, a5, a6); if (res >= 0 && path) { enum ProcFdType t = classify_proc_path(path); if (t != FD_TYPE_NONE) add_tracked_fd((int)res, t); } g_in_hook = 0; return res; }
 #endif
 #ifdef SYS_open
-        if (number == SYS_open) { const char *path = (const char *)a1; if (is_hidden_path(path)) { g_in_hook = 0; errno = ENOENT; return -1; } long res = raw_syscall(number, a1, a2, a3, a4, a5, a6); if (res >= 0 && path) { enum ProcFdType t = classify_proc_path(path); if (t != FD_TYPE_NONE) add_tracked_fd((int)res, t); } g_in_hook = 0; return res; }
+        if (number == SYS_open) { const char *path = (const char *)a1; long res = raw_syscall(number, a1, a2, a3, a4, a5, a6); if (res >= 0 && path) { enum ProcFdType t = classify_proc_path(path); if (t != FD_TYPE_NONE) add_tracked_fd((int)res, t); } g_in_hook = 0; return res; }
 #endif
 #ifdef SYS_access
-        if (number == SYS_access) { if (is_hidden_path((const char *)a1)) { g_in_hook = 0; errno = ENOENT; return -1; } }
+        if (number == SYS_access) { if (cfg_spoof_selinux_file && (const char *)a1 && strcmp((const char *)a1, "/sys/fs/selinux/enforce") == 0) { g_in_hook = 0; return 0; } g_in_hook = 0; return raw_syscall(number, a1, a2, a3, a4, a5, a6); }
 #endif
 #ifdef SYS_faccessat
-        if (number == SYS_faccessat) { if (is_hidden_path((const char *)a2)) { g_in_hook = 0; errno = ENOENT; return -1; } }
+        if (number == SYS_faccessat) { if (cfg_spoof_selinux_file && (const char *)a2 && strcmp((const char *)a2, "/sys/fs/selinux/enforce") == 0) { g_in_hook = 0; return 0; } g_in_hook = 0; return raw_syscall(number, a1, a2, a3, a4, a5, a6); }
 #endif
 #ifdef SYS_faccessat2
-        if (number == SYS_faccessat2) { if (is_hidden_path((const char *)a2)) { g_in_hook = 0; errno = ENOENT; return -1; } }
+        if (number == SYS_faccessat2) { if (cfg_spoof_selinux_file && (const char *)a2 && strcmp((const char *)a2, "/sys/fs/selinux/enforce") == 0) { g_in_hook = 0; return 0; } g_in_hook = 0; return raw_syscall(number, a1, a2, a3, a4, a5, a6); }
 #endif
 #ifdef SYS_stat
-        if (number == SYS_stat) { if (is_hidden_path((const char *)a1)) { g_in_hook = 0; errno = ENOENT; return -1; } }
+        if (number == SYS_stat) { if (cfg_spoof_selinux_file && (const char *)a1 && strcmp((const char *)a1, "/sys/fs/selinux/enforce") == 0) { if (a2) { struct stat *st = (struct stat *)a2; memset(st, 0, sizeof(*st)); st->st_mode = S_IFREG|0644; st->st_size = 2; st->st_nlink = 1; } g_in_hook = 0; return 0; } g_in_hook = 0; return raw_syscall(number, a1, a2, a3, a4, a5, a6); }
 #endif
 #ifdef SYS_lstat
-        if (number == SYS_lstat) { if (is_hidden_path((const char *)a1)) { g_in_hook = 0; errno = ENOENT; return -1; } }
+        if (number == SYS_lstat) { if (cfg_spoof_selinux_file && (const char *)a1 && strcmp((const char *)a1, "/sys/fs/selinux/enforce") == 0) { if (a2) { struct stat *st = (struct stat *)a2; memset(st, 0, sizeof(*st)); st->st_mode = S_IFREG|0644; st->st_size = 2; st->st_nlink = 1; } g_in_hook = 0; return 0; } g_in_hook = 0; return raw_syscall(number, a1, a2, a3, a4, a5, a6); }
 #endif
 #ifdef SYS_fstatat
-        if (number == SYS_fstatat) { if (is_hidden_path((const char *)a2)) { g_in_hook = 0; errno = ENOENT; return -1; } }
+        if (number == SYS_fstatat) { if (cfg_spoof_selinux_file && (const char *)a2 && strcmp((const char *)a2, "/sys/fs/selinux/enforce") == 0) { if (a3) { struct stat *st = (struct stat *)a3; memset(st, 0, sizeof(*st)); st->st_mode = S_IFREG|0644; st->st_size = 2; st->st_nlink = 1; } g_in_hook = 0; return 0; } g_in_hook = 0; return raw_syscall(number, a1, a2, a3, a4, a5, a6); }
 #endif
 #ifdef SYS_newfstatat
-        if (number == SYS_newfstatat) { if (is_hidden_path((const char *)a2)) { g_in_hook = 0; errno = ENOENT; return -1; } }
+        if (number == SYS_newfstatat) { if (cfg_spoof_selinux_file && (const char *)a2 && strcmp((const char *)a2, "/sys/fs/selinux/enforce") == 0) { if (a3) { struct stat *st = (struct stat *)a3; memset(st, 0, sizeof(*st)); st->st_mode = S_IFREG|0644; st->st_size = 2; st->st_nlink = 1; } g_in_hook = 0; return 0; } g_in_hook = 0; return raw_syscall(number, a1, a2, a3, a4, a5, a6); }
 #endif
 #ifdef __NR_statx
-        if (number == __NR_statx) { if (is_hidden_path((const char *)a2)) { g_in_hook = 0; errno = ENOENT; return -1; } }
+        if (number == __NR_statx) { g_in_hook = 0; return raw_syscall(number, a1, a2, a3, a4, a5, a6); }
 #endif
 #ifdef __NR_openat2
-        if (number == __NR_openat2) { const char *path = (const char *)a2; if (is_hidden_path(path)) { g_in_hook = 0; errno = ENOENT; return -1; } long res = raw_syscall(number, a1, a2, a3, a4, a5, a6); if (res >= 0 && path) { enum ProcFdType t = classify_proc_path(path); if (t != FD_TYPE_NONE) add_tracked_fd((int)res, t); } g_in_hook = 0; return res; }
+        if (number == __NR_openat2) { const char *path = (const char *)a2; long res = raw_syscall(number, a1, a2, a3, a4, a5, a6); if (res >= 0 && path) { enum ProcFdType t = classify_proc_path(path); if (t != FD_TYPE_NONE) add_tracked_fd((int)res, t); } g_in_hook = 0; return res; }
 #endif
 #ifdef __NR_faccessat2
-        if (number == __NR_faccessat2) { if (is_hidden_path((const char *)a2)) { g_in_hook = 0; errno = ENOENT; return -1; } }
+        if (number == __NR_faccessat2) { if (cfg_spoof_selinux_file && (const char *)a2 && strcmp((const char *)a2, "/sys/fs/selinux/enforce") == 0) { g_in_hook = 0; return 0; } g_in_hook = 0; return raw_syscall(number, a1, a2, a3, a4, a5, a6); }
 #endif
 #ifdef SYS_readlink
         if (number == SYS_readlink) { if (is_hidden_path((const char *)a1)) { g_in_hook = 0; errno = ENOENT; return -1; } }
@@ -1898,7 +2018,7 @@ struct hook_entry {
     void *hook;
 };
 
-#define HOOK_COUNT 40
+#define HOOK_COUNT 50
 static struct hook_entry g_hook_table[HOOK_COUNT];
 static int g_hook_table_built = 0;
 
@@ -1942,6 +2062,10 @@ static void build_hook_table(void) {
     g_hook_table[i++] = (struct hook_entry){"posix_spawn", (void*)posix_spawn_hook};
     g_hook_table[i++] = (struct hook_entry){"getpid", (void*)getpid_hook};
     g_hook_table[i++] = (struct hook_entry){"getppid", (void*)getppid_hook};
+    g_hook_table[i++] = (struct hook_entry){"dlsym", (void*)dlsym_hook};
+    g_hook_table[i++] = (struct hook_entry){"dlvsym", (void*)dlvsym_hook};
+    g_hook_table[i++] = (struct hook_entry){"dladdr", (void*)dladdr_hook};
+    g_hook_table[i++] = (struct hook_entry){"dlopen", (void*)dlopen_hook};
 }
 
 static void *find_hook(const char *name) {
@@ -2130,6 +2254,10 @@ static void install_zygisk_plt_hooks(void) {
     g_api->pltHookRegister(0, 0, "posix_spawn", (void*)posix_spawn_hook, (void**)&real_posix_spawn);
     g_api->pltHookRegister(0, 0, "getpid", (void*)getpid_hook, (void**)&real_getpid);
     g_api->pltHookRegister(0, 0, "getppid", (void*)getppid_hook, (void**)&real_getppid);
+    g_api->pltHookRegister(0, 0, "dlsym", (void*)dlsym_hook, (void**)&real_dlsym);
+    g_api->pltHookRegister(0, 0, "dlvsym", (void*)dlvsym_hook, (void**)&real_dlvsym);
+    g_api->pltHookRegister(0, 0, "dladdr", (void*)dladdr_hook, (void**)&real_dladdr);
+    g_api->pltHookRegister(0, 0, "dlopen", (void*)dlopen_hook, (void**)&real_dlopen);
 
     g_api->pltHookCommit();
     LOGI("install_zygisk_plt_hooks: commit done");
