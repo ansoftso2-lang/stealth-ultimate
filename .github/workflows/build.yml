@@ -2,74 +2,90 @@ name: Build Stealth Ultimate
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [main, master]
   workflow_dispatch:
-    inputs:
-      trigger:
-        description: 'Trigger build'
-        required: false
-        default: 'build'
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           fetch-depth: 1
-      
+
       - name: Cache NDK
+        id: ndk-cache
         uses: actions/cache@v4
         with:
           path: android-ndk-r27b
           key: ndk-r27b-${{ runner.os }}
-          restore-keys: ndk-r27b-${{ runner.os }}
-      
+
       - name: Install NDK r27b
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
         run: |
-          rm -rf android-ndk-r27b
+          rm -rf android-ndk-r27b android-ndk-r27b-linux.zip
           wget -q https://dl.google.com/android/repository/android-ndk-r27b-linux.zip
-          unzip -q -o android-ndk-r27b-linux.zip
-          echo "NDK_HOME=$GITHUB_WORKSPACE/android-ndk-r27b" >> $GITHUB_ENV
-          echo "NDK=$GITHUB_WORKSPACE/android-ndk-r27b" >> $GITHUB_ENV
+          unzip -q android-ndk-r27b-linux.zip
+          rm -f android-ndk-r27b-linux.zip
         timeout-minutes: 10
-      
-      - name: Build .so files
+
+      - name: Build native libraries
+        env:
+          NDK_HOME: ${{ github.workspace }}/android-ndk-r27b
+          ANDROID_NDK_HOME: ${{ github.workspace }}/android-ndk-r27b
         run: |
-          cd $GITHUB_WORKSPACE/sources
-          export NDK_HOME=$NDK_HOME
-          export CC=clang
-          bash compile.sh
-          ls -lh $GITHUB_WORKSPACE/sources/zygisk/*.so
-      
-      - name: Sync build artifacts
+          rm -f sources/zygisk/*.so
+          bash sources/compile.sh
+          for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+            test -s "sources/zygisk/$abi.so" || {
+              echo "Missing or empty sources/zygisk/$abi.so"
+              exit 1
+            }
+          done
+          ls -lh sources/zygisk/*.so
+
+      - name: Assemble installable module
         run: |
-          mkdir -p $GITHUB_WORKSPACE/build/zygisk
-          cp $GITHUB_WORKSPACE/sources/zygisk/*.so $GITHUB_WORKSPACE/build/zygisk/
-          cp -r $GITHUB_WORKSPACE/sources/shell/* $GITHUB_WORKSPACE/build/
-          cp -r $GITHUB_WORKSPACE/sources/shell/common/* $GITHUB_WORKSPACE/build/common/
-          cp $GITHUB_WORKSPACE/sources/module/module.prop $GITHUB_WORKSPACE/build/
-          ls -lh $GITHUB_WORKSPACE/build/
-      
-      - name: Package module
+          rm -rf build stealth_ultimate.zip
+          mkdir -p build/zygisk build/common
+          cp sources/zygisk/arm64-v8a.so build/zygisk/
+          cp sources/zygisk/armeabi-v7a.so build/zygisk/
+          cp sources/zygisk/x86.so build/zygisk/
+          cp sources/zygisk/x86_64.so build/zygisk/
+          cp sources/module/module.prop build/module.prop
+          cp sources/shell/*.sh build/
+          cp sources/shell/common/stealth.conf.default build/common/
+          chmod 0755 build/*.sh
+          chmod 0644 build/module.prop build/common/stealth.conf.default build/zygisk/*.so
+          test "$(od -An -tx1 -N3 build/module.prop | tr -d ' \n')" != "efbbbf" || {
+            echo "module.prop contains a UTF-8 BOM"
+            exit 1
+          }
+          (cd build && zip -q -r ../stealth_ultimate.zip .)
+
+      - name: Validate installable ZIP
         run: |
-          cd $GITHUB_WORKSPACE/build
-          zip -r $GITHUB_WORKSPACE/stealth_ultimate.zip .
-      
-      - name: Upload artifacts
+          test -s stealth_ultimate.zip
+          for file in \
+            module.prop customize.sh post-fs-data.sh service.sh \
+            zygisk/arm64-v8a.so zygisk/armeabi-v7a.so \
+            zygisk/x86.so zygisk/x86_64.so; do
+            unzip -Z1 stealth_ultimate.zip | grep -Fx "$file" >/dev/null || {
+              echo "Missing from stealth_ultimate.zip: $file"
+              exit 1
+            }
+          done
+          unzip -t stealth_ultimate.zip
+          unzip -l stealth_ultimate.zip
+
+      - name: Upload installable module
         uses: actions/upload-artifact@v4
         with:
           name: stealth-ultimate
           path: stealth_ultimate.zip
+          if-no-files-found: error
           retention-days: 30
-      
-      - name: Upload to release
-        if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v1
-        with:
-          files: stealth_ultimate.zip
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

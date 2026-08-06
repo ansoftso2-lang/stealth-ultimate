@@ -169,7 +169,7 @@ extern long ptrace(int __request, ...);
 #endif
 #endif
 
-#define ZYGISK_API_VERSION 2
+#define ZYGISK_API_VERSION 4
 
 struct zygisk_module_abi {
     long api_version;
