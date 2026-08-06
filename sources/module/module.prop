@@ -1,0 +1,7 @@
+﻿id=stealth_ultimate
+name=Stealth Ultimate
+version=v2.1
+versionCode=210
+author=stealth
+description=Zygisk anti-detection module. Hides root, Magisk, KSU, APatch, Zygisk, LSPosed, Frida, Xposed, Riru, Shamiko, busybox, SELinux, NPatch/LSPatch. Spoofs device props, kernel, CPU, mounts, maps, environ, net/tcp, net/unix, SELinux context. Hooks: open/openat/access/stat/lstat/fstatat/readlink/readlinkat/readdir/read/close/fopen/fclose/fread/fgets/getline, __system_property_get/find, uname/ptrace/prctl/syscall/getauxval, socket/connect/bind/listen/getsockname/getpeername/recvmsg/sendmsg/getsockopt/setsockopt, dlsym/dladdr/dlvsym/dlopen, fork/vfork/clone/execve/execveat/posix_spawn. Blocks Frida ports 27042/27043. Play Integrity: verified boot, vbmeta, keymaster, safetynet, debuggable, secure. Auto-exempts apps with root access. No GUI — everything enabled by default.
+minMagisk=24000
