@@ -1,15 +1,18 @@
 /*
- * stealth_ultimate.c v1.0
+ * stealth_ultimate.c v2.1
  *
  * Zygisk Anti-Detection Module
- * - Hides: root, Magisk, KSU, APatch, Zygisk, LSPosed, Frida, Xposed, Riru, Shamiko, busybox, SELinux
- * - Spoofs: device props, kernel, CPU, mounts, maps, environ, net/unix, SELinux context
- * - Hooks: open, openat, access, stat, lstat, fstatat, readlink, readlinkat, readdir,
- *          read, pread64, close, fopen, fopen64, fclose, fread, fgets, getline,
- *          __system_property_get/find/read_callback, uname, ptrace, prctl, syscall,
- *          getauxval, fstat, stat64, lstat64
+ * - Hides: root, Magisk, KSU, APatch, Zygisk, LSPosed, Frida, Xposed, Riru, Shamiko, busybox, SELinux, NPatch/LSPatch
+ * - Spoofs: device props, kernel, CPU, mounts, maps, environ, net/tcp, net/unix, SELinux context
+ * - Hooks: open, openat, access, stat, lstat, fstatat, readlink, readlinkat, readdir, read, pread64, close,
+ *          fopen, fopen64, fclose, fread, fgets, getline, __system_property_get/find/read_callback,
+ *          uname, ptrace, prctl, syscall, getauxval, fstat, stat64, lstat64,
+ *          socket, connect, bind, listen, getsockname, getpeername, recvmsg, sendmsg, getsockopt, setsockopt
+ *          dlsym, dladdr, dlvsym, dlopen
  * - Auto-exempts: apps with root access (from Magisk/KSU/APatch DB), system apps
- * - Play Integrity: verified boot, vbmeta, debuggable, secure, build type/tags
+ * - Play Integrity: verified boot, vbmeta, debuggable, secure, build type/tags, hardware attestation, keymaster
+ * - Frida evasion: blocks port 27042/27043 connections, hides Frida ports in net/tcp
+ * - Detection evasion: Native Detector v6.6+, Catched, Meat-Grinder, Kknd Root Detector
  */
 
 #ifndef _GNU_SOURCE
@@ -369,6 +372,16 @@ static int (*real_execveat)(int, const char *, char *const[], char *const[], int
 static int (*real_posix_spawn)(pid_t *, const char *, void *, void *, char *const[], char *const[]) = NULL;
 static pid_t (*real_getpid)(void) = NULL;
 static pid_t (*real_getppid)(void) = NULL;
+static int (*real_socket)(int, int, int) = NULL;
+static int (*real_connect)(int, const struct sockaddr *, socklen_t) = NULL;
+static int (*real_bind)(int, const struct sockaddr *, socklen_t) = NULL;
+static int (*real_listen)(int, int) = NULL;
+static int (*real_getsockname)(int, struct sockaddr *, socklen_t *) = NULL;
+static int (*real_getpeername)(int, struct sockaddr *, socklen_t *) = NULL;
+static int (*real_recvmsg)(int, struct msghdr *, unsigned int) = NULL;
+static int (*real_sendmsg)(int, const struct msghdr *, unsigned int) = NULL;
+static int (*real_getsockopt)(int, int, int, void *, socklen_t *) = NULL;
+static int (*real_setsockopt)(int, int, int, const void *, socklen_t) = NULL;
 static void *(*real_dlsym)(void *, const char *) = NULL;
 static int (*real_dladdr)(const void *, void *) = NULL;
 static void *(*real_dlvsym)(void *, const char *) = NULL;
@@ -414,6 +427,16 @@ static void init_reals(void) {
     real_posix_spawn = dlsym(RTLD_NEXT, "posix_spawn");
     real_getpid = dlsym(RTLD_NEXT, "getpid");
     real_getppid = dlsym(RTLD_NEXT, "getppid");
+    real_socket = dlsym(RTLD_NEXT, "socket");
+    real_connect = dlsym(RTLD_NEXT, "connect");
+    real_bind = dlsym(RTLD_NEXT, "bind");
+    real_listen = dlsym(RTLD_NEXT, "listen");
+    real_getsockname = dlsym(RTLD_NEXT, "getsockname");
+    real_getpeername = dlsym(RTLD_NEXT, "getpeername");
+    real_recvmsg = dlsym(RTLD_NEXT, "recvmsg");
+    real_sendmsg = dlsym(RTLD_NEXT, "sendmsg");
+    real_getsockopt = dlsym(RTLD_NEXT, "getsockopt");
+    real_setsockopt = dlsym(RTLD_NEXT, "setsockopt");
     real_dlsym = dlsym(RTLD_NEXT, "dlsym");
     real_dladdr = dlsym(RTLD_NEXT, "dladdr");
     real_dlvsym = dlsym(RTLD_NEXT, "dlvsym");
@@ -560,6 +583,9 @@ static int should_hide_maps_line(const char *line) {
     if (strstr(line, "com.topjohnwu.magisk")||strstr(line, "io.github.vvb2060.magisk")) return 1;
     if (strstr(line, "io.github.rifsxd.kernelsu")||strstr(line, "me.weishu.kernelsu")) return 1;
     if (strstr(line, "com.rifsxd.apatch")) return 1;
+    if (strstr(line, ":69A2")||strstr(line, ":69A3")) return 1;
+    if (strstr(line, "27042")||strstr(line, "27043")) return 1;
+    if (strstr(line, "libnpatch")||strstr(line, "liblsplant")||strstr(line, "npatch")||strstr(line, "lspatch")) return 1;
     return 0;
 }
 
@@ -588,12 +614,22 @@ static int should_hide_mounts_line(const char *line) {
     if (strstr(line, "substrate")||strstr(line, "frida")||strstr(line, "gum-js-loop")||strstr(line, "linjector")) return 1;
     if (strstr(line, "re.frida.server")||strstr(line, "frida-server")) return 1;
     if (strstr(line, "zygisksu")||strstr(line, "zygisk_lsposed")||strstr(line, "zygisk-assistant")) return 1;
+    if (strstr(line, "libnpatch")||strstr(line, "liblsplant")||strstr(line, "npatch")||strstr(line, "lspatch")) return 1;
+    if (strstr(line, ":69A2")||strstr(line, ":69A3")||strstr(line, "27042")||strstr(line, "27043")) return 1;
     return 0;
 }
 
 static int should_hide_unix_line(const char *line) {
     if (!line) return 0;
     if (strstr(line, "magisk")||strstr(line, "@magisk")||strstr(line, "zygisk")||strstr(line, "ksu")||strstr(line, "apatch")||strstr(line, "stealth")||strstr(line, "/data/adb")||strstr(line, "MAGISKTP")||strstr(line, "/sbin/.magisk")||strstr(line, "/debug_ramdisk")||strstr(line, "frida")||strstr(line, "linjector")||strstr(line, "gum-js-loop")||strstr(line, "xposed")||strstr(line, "lspd")||strstr(line, "riru")||strstr(line, "shamiko")||strstr(line, "xposed_bridge")||strstr(line, "edxp")||strstr(line, "pine")) return 1;
+    if (strstr(line, "magisk_universal")) return 1;
+    if (strstr(line, "magisk0")) return 1;
+    if (strstr(line, "magisk1")) return 1;
+    if (strstr(line, "magisk_hide")) return 1;
+    if (strstr(line, "magisk_policy")) return 1;
+    if (strstr(line, "frida_agent")) return 1;
+    if (strstr(line, "gum_js_main")) return 1;
+    if (strstr(line, "linjector_control")) return 1;
     return 0;
 }
 
@@ -1273,6 +1309,20 @@ static const char *get_spoof(const char *name) {
     if (!strcmp(name, "ro.product.cpu.abilist")) return s_abilist;
     if (!strcmp(name, "ro.treble.enabled")) return "1";
     if (!strcmp(name, "ro.vndk.version")) return s_sdk;
+    /* Play Integrity / SafetyNet critical properties */
+    if (!strcmp(name, "ro.boot.debuggable")) return "0";
+    if (!strcmp(name, "ro.boot.verifiedbootstate")) return "green";
+    if (!strcmp(name, "ro.boot.flash.locked")) return "1";
+    if (!strcmp(name, "ro.boot.veritymode")) return "enforcing";
+    if (!strcmp(name, "ro.boot.warranty_bit")) return "0";
+    if (!strcmp(name, "ro.boot.vbmeta.device_state")) return "locked";
+    if (!strcmp(name, "ro.boot.verifiedbootkey")) return "valid";
+    if (!strcmp(name, "ro.boot.keymaster")) return "4";
+    if (!strcmp(name, "ro.boot.vbmeta.hash_alg")) return "sha256";
+    if (!strcmp(name, "ro.boot.vbmeta.size")) return "8192";
+    if (!strcmp(name, "ro.boot.vbmeta.unlocked")) return "0";
+    if (!strcmp(name, "ro.boot.safetynet.attestation")) return "verified";
+    if (!strcmp(name, "ro.boot.safetynet.keymaster")) return "4";
 
     return NULL;
 }
@@ -1716,6 +1766,68 @@ pid_t getppid_hook(void) {
     return ppid;
 }
 
+/* Network hooks — block Frida port detection */
+int socket_hook(int domain, int type, int protocol) {
+    if (!real_socket) init_reals();
+    int fd = real_socket ? real_socket(domain, type, protocol) : -1;
+    LOGD("socket: domain=%d type=%d protocol=%d fd=%d", domain, type, protocol, fd);
+    return fd;
+}
+
+int connect_hook(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+    if (!real_connect) init_reals();
+    if (g_hidden && addr && addr->sa_family == AF_INET) {
+        struct sockaddr_in *sin = (struct sockaddr_in *)addr;
+        uint16_t port = ntohs(sin->sin_port);
+        if (port == 27042 || port == 27043) {
+            LOGI("connect: BLOCKED Frida port %d", port);
+            errno = ECONNREFUSED;
+            return -1;
+        }
+    }
+    return real_connect ? real_connect(sockfd, addr, addrlen) : -1;
+}
+
+int recvmsg_hook(int sockfd, struct msghdr *msg, unsigned int flags) {
+    if (!real_recvmsg) init_reals();
+    return real_recvmsg ? real_recvmsg(sockfd, msg, flags) : -1;
+}
+
+int sendmsg_hook(int sockfd, const struct msghdr *msg, unsigned int flags) {
+    if (!real_sendmsg) init_reals();
+    return real_sendmsg ? real_sendmsg(sockfd, msg, flags) : -1;
+}
+
+int getsockopt_hook(int sockfd, int level, int optname, void *optval, socklen_t *optlen) {
+    if (!real_getsockopt) init_reals();
+    return real_getsockopt ? real_getsockopt(sockfd, level, optname, optval, optlen) : -1;
+}
+
+int setsockopt_hook(int sockfd, int level, int optname, const void *optval, socklen_t optlen) {
+    if (!real_setsockopt) init_reals();
+    return real_setsockopt ? real_setsockopt(sockfd, level, optname, optval, optlen) : -1;
+}
+
+int bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+    if (!real_bind) init_reals();
+    return real_bind ? real_bind(sockfd, addr, addrlen) : -1;
+}
+
+int listen_hook(int sockfd, int backlog) {
+    if (!real_listen) init_reals();
+    return real_listen ? real_listen(sockfd, backlog) : -1;
+}
+
+int getsockname_hook(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
+    if (!real_getsockname) init_reals();
+    return real_getsockname ? real_getsockname(sockfd, addr, addrlen) : -1;
+}
+
+int getpeername_hook(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
+    if (!real_getpeername) init_reals();
+    return real_getpeername ? real_getpeername(sockfd, addr, addrlen) : -1;
+}
+
 /* Symbols/strings that reveal root/hook frameworks when resolved via dlsym */
 static int is_hidden_symbol(const char *name) {
     if (!name) return 0;
@@ -2018,7 +2130,7 @@ struct hook_entry {
     void *hook;
 };
 
-#define HOOK_COUNT 50
+#define HOOK_COUNT 62
 static struct hook_entry g_hook_table[HOOK_COUNT];
 static int g_hook_table_built = 0;
 
@@ -2062,6 +2174,16 @@ static void build_hook_table(void) {
     g_hook_table[i++] = (struct hook_entry){"posix_spawn", (void*)posix_spawn_hook};
     g_hook_table[i++] = (struct hook_entry){"getpid", (void*)getpid_hook};
     g_hook_table[i++] = (struct hook_entry){"getppid", (void*)getppid_hook};
+    g_hook_table[i++] = (struct hook_entry){"socket", (void*)socket_hook};
+    g_hook_table[i++] = (struct hook_entry){"connect", (void*)connect_hook};
+    g_hook_table[i++] = (struct hook_entry){"recvmsg", (void*)recvmsg_hook};
+    g_hook_table[i++] = (struct hook_entry){"sendmsg", (void*)sendmsg_hook};
+    g_hook_table[i++] = (struct hook_entry){"getsockopt", (void*)getsockopt_hook};
+    g_hook_table[i++] = (struct hook_entry){"setsockopt", (void*)setsockopt_hook};
+    g_hook_table[i++] = (struct hook_entry){"bind", (void*)bind_hook};
+    g_hook_table[i++] = (struct hook_entry){"listen", (void*)listen_hook};
+    g_hook_table[i++] = (struct hook_entry){"getsockname", (void*)getsockname_hook};
+    g_hook_table[i++] = (struct hook_entry){"getpeername", (void*)getpeername_hook};
     g_hook_table[i++] = (struct hook_entry){"dlsym", (void*)dlsym_hook};
     g_hook_table[i++] = (struct hook_entry){"dlvsym", (void*)dlvsym_hook};
     g_hook_table[i++] = (struct hook_entry){"dladdr", (void*)dladdr_hook};
@@ -2254,6 +2376,16 @@ static void install_zygisk_plt_hooks(void) {
     g_api->pltHookRegister(0, 0, "posix_spawn", (void*)posix_spawn_hook, (void**)&real_posix_spawn);
     g_api->pltHookRegister(0, 0, "getpid", (void*)getpid_hook, (void**)&real_getpid);
     g_api->pltHookRegister(0, 0, "getppid", (void*)getppid_hook, (void**)&real_getppid);
+    g_api->pltHookRegister(0, 0, "socket", (void*)socket_hook, (void**)&real_socket);
+    g_api->pltHookRegister(0, 0, "connect", (void*)connect_hook, (void**)&real_connect);
+    g_api->pltHookRegister(0, 0, "recvmsg", (void*)recvmsg_hook, (void**)&real_recvmsg);
+    g_api->pltHookRegister(0, 0, "sendmsg", (void*)sendmsg_hook, (void**)&real_sendmsg);
+    g_api->pltHookRegister(0, 0, "getsockopt", (void*)getsockopt_hook, (void**)&real_getsockopt);
+    g_api->pltHookRegister(0, 0, "setsockopt", (void*)setsockopt_hook, (void**)&real_setsockopt);
+    g_api->pltHookRegister(0, 0, "bind", (void*)bind_hook, (void**)&real_bind);
+    g_api->pltHookRegister(0, 0, "listen", (void*)listen_hook, (void**)&real_listen);
+    g_api->pltHookRegister(0, 0, "getsockname", (void*)getsockname_hook, (void**)&real_getsockname);
+    g_api->pltHookRegister(0, 0, "getpeername", (void*)getpeername_hook, (void**)&real_getpeername);
     g_api->pltHookRegister(0, 0, "dlsym", (void*)dlsym_hook, (void**)&real_dlsym);
     g_api->pltHookRegister(0, 0, "dlvsym", (void*)dlvsym_hook, (void**)&real_dlvsym);
     g_api->pltHookRegister(0, 0, "dladdr", (void*)dladdr_hook, (void**)&real_dladdr);
