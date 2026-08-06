@@ -169,7 +169,7 @@ extern long ptrace(int __request, ...);
 #endif
 #endif
 
-#define ZYGISK_API_VERSION 4
+#define ZYGISK_API_VERSION 2
 
 struct zygisk_module_abi {
     long api_version;
@@ -2429,9 +2429,8 @@ static void c_preAppSpecialize(void *impl, void *args) {
     LOGI("preAppSpecialize: start");
     init_reals();
     load_config();
-    /* Use Zygisk getFlags() for root detection - much more reliable than reading DB */
     if (g_api && g_api->getFlags) {
-        g_zygisk_flags = g_api->getFlags(g_api->impl);
+        g_zygisk_flags = g_api->getFlags(impl);
     }
     LOGI("preAppSpecialize: flags=%u", g_zygisk_flags);
 }
@@ -2460,7 +2459,10 @@ void zygisk_module_entry(struct zygisk_api_table *table, void *env) {
     g_module_abi.postAppSpecialize = c_postAppSpecialize;
     g_module_abi.preServerSpecialize = c_preServerSpecialize;
     g_module_abi.postServerSpecialize = c_postServerSpecialize;
-    table->registerModule(table, &g_module_abi);
+    if (table->registerModule(table, &g_module_abi) != 0) {
+        LOGE("module_entry: registerModule failed");
+        return;
+    }
     LOGI("module_entry: registered callbacks successfully");
     (void)env;
 }
