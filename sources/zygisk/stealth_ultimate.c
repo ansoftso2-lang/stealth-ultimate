@@ -40,6 +40,9 @@
 #include <link.h>
 #include <elf.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #define LOG_PATH "/data/local/tmp/stealth_ultimate.log"
 #define LOG_BUF_SIZE 1024
@@ -384,7 +387,7 @@ static int (*real_getsockopt)(int, int, int, void *, socklen_t *) = NULL;
 static int (*real_setsockopt)(int, int, int, const void *, socklen_t) = NULL;
 static void *(*real_dlsym)(void *, const char *) = NULL;
 static int (*real_dladdr)(const void *, void *) = NULL;
-static void *(*real_dlvsym)(void *, const char *) = NULL;
+static void *(*real_dlvsym)(void *, const char *, const char *) = NULL;
 static void *(*real_dlopen)(const char *, int) = NULL;
 
 static void init_reals(void) {
@@ -1858,14 +1861,14 @@ void *dlsym_hook(void *handle, const char *name) {
     return real_dlsym ? real_dlsym(handle, name) : dlsym(handle, name);
 }
 
-void *dlvsym_hook(void *handle, const char *name) {
+void *dlvsym_hook(void *handle, const char *name, const char *version) {
     if (!g_in_hook && g_hidden && name) {
         g_in_hook = 1;
         if (is_hidden_symbol(name)) { g_in_hook = 0; return NULL; }
         g_in_hook = 0;
     }
     if (!real_dlvsym) init_reals();
-    return real_dlvsym ? real_dlvsym(handle, name) : dlvsym(handle, name);
+    return real_dlvsym ? real_dlvsym(handle, name, version) : dlvsym(handle, name, version);
 }
 
 int dladdr_hook(const void *addr, void *info) {
