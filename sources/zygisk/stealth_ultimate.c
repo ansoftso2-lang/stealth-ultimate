@@ -637,7 +637,6 @@ static int should_hide_mounts_line(const char *line) {
     if (strstr(line, "/system/addon.d") || strstr(line, "install-recovery")) return 1;
     return 0;
 }
-}
 
 static int should_hide_unix_line(const char *line) {
     if (!line) return 0;
