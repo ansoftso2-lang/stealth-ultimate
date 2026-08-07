@@ -1866,6 +1866,8 @@ int posix_spawn_hook(pid_t *pid, const char *path, void *actions, void *attr, ch
     return real_posix_spawn ? real_posix_spawn(pid, path, actions, attr, argv, envp) : -1;
 }
 
+static long raw_syscall(long number, long a1, long a2, long a3, long a4, long a5, long a6);
+
 pid_t getpid_hook(void) {
     if (!real_getpid) init_reals();
     /* NEVER call getpid() as fallback — it's hooked to us → infinite recursion.
