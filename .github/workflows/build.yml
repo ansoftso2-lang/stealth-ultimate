@@ -96,11 +96,11 @@ jobs:
       - name: Commit updated module ZIP to repo
         if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
         run: |
           git config --global user.email "action@github.com"
           git config --global user.name "GitHub Action"
-          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+          git remote set-url origin https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
           git checkout main || git checkout master
           git add -f stealth_ultimate.zip
           if git diff --cached --quiet; then
