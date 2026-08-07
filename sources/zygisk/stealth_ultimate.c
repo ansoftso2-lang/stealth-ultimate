@@ -545,6 +545,8 @@ static int should_hide_property(const char *name) {
     if (strncmp(name, "init.svc.ksu", 12) == 0) return 1;
     if (strncmp(name, "init.svc.apd", 12) == 0) return 1;
     if (strncmp(name, "init.svc.apatch", 15) == 0) return 1;
+    if (strstr(name, "persist.sys.pixelprops")) return 1;
+    if (strstr(name, "ro.boot.vbmeta")) return 1;
     if (strcmp(name, "ro.boot.veritymode") == 0) return 0; /* spoofed */
     if (strcmp(name, "ro.boot.verity_mode") == 0) return 0; /* spoofed */
     if (strcmp(name, "persist.sys.safetynet") == 0) return 0;
@@ -589,6 +591,18 @@ static int should_hide_maps_line(const char *line) {
     if (strstr(line, ":69A2")||strstr(line, ":69A3")) return 1;
     if (strstr(line, "27042")||strstr(line, "27043")) return 1;
     if (strstr(line, "libnpatch")||strstr(line, "liblsplant")||strstr(line, "npatch")||strstr(line, "lspatch")) return 1;
+    if (strstr(line, "zygisk")||strstr(line, "magisk")) return 1;
+    if (strstr(line, "lsposed")||strstr(line, "xposed")) return 1;
+    if (strstr(line, "riru")||strstr(line, "substrate")) return 1;
+    if (strstr(line, "shamiko")||strstr(line, "frida")) return 1;
+    if (strstr(line, "gum-js-loop")||strstr(line, "linjector")) return 1;
+    if (strstr(line, "re.frida.server")) return 1;
+    if (strstr(line, "/data/adb")) return 1;
+    if (strstr(line, "/data/ksu")) return 1;
+    if (strstr(line, "/data/apatch")) return 1;
+    if (strstr(line, "/data/local/tmp")) return 1;
+    if (strstr(line, "/sbin/.magisk")) return 1;
+    if (strstr(line, "/debug_ramdisk")) return 1;
     return 0;
 }
 
@@ -617,9 +631,12 @@ static int should_hide_mounts_line(const char *line) {
     if (strstr(line, "substrate")||strstr(line, "frida")||strstr(line, "gum-js-loop")||strstr(line, "linjector")) return 1;
     if (strstr(line, "re.frida.server")||strstr(line, "frida-server")) return 1;
     if (strstr(line, "zygisksu")||strstr(line, "zygisk_lsposed")||strstr(line, "zygisk-assistant")) return 1;
-    if (strstr(line, "libnpatch")||strstr(line, "liblsplant")||strstr(line, "npatch")||strstr(line, "lspatch")) return 1;
-    if (strstr(line, ":69A2")||strstr(line, ":69A3")||strstr(line, "27042")||strstr(line, "27043")) return 1;
+    if (strstr(line, "peer") || strstr(line, "bind") || strstr(line, "tmpfs") || strstr(line, "overlay")) return 1;
+    if (strstr(line, "idmapped") || strstr(line, "shared") || strstr(line, "rprivate") || strstr(line, "rbind")) return 1;
+    if (strstr(line, "magisk_addon") || strstr(line, "magisk_pfsd") || strstr(line, "magisk_busybox") || strstr(line, "magiskexec")) return 1;
+    if (strstr(line, "/system/addon.d") || strstr(line, "install-recovery")) return 1;
     return 0;
+}
 }
 
 static int should_hide_unix_line(const char *line) {
@@ -633,6 +650,15 @@ static int should_hide_unix_line(const char *line) {
     if (strstr(line, "frida_agent")) return 1;
     if (strstr(line, "gum_js_main")) return 1;
     if (strstr(line, "linjector_control")) return 1;
+    if (strstr(line, "zygisk")) return 1;
+    if (strstr(line, "zygisksu")) return 1;
+    if (strstr(line, "zygisk_lsposed")) return 1;
+    if (strstr(line, "zygisk-assistant")) return 1;
+    if (strstr(line, "magiskd")) return 1;
+    if (strstr(line, "magiskinit")) return 1;
+    if (strstr(line, "ksud")) return 1;
+    if (strstr(line, "apd")) return 1;
+    if (strstr(line, "lspd")) return 1;
     return 0;
 }
 
@@ -949,7 +975,7 @@ static int is_hidden_path(const char *p) {
     if (strstr(p, "/proc/self/cmdline")) return 0;
 
     /* Magisk */
-    if (strstr(p, "/sbin/.magisk")||strstr(p, "/data/adb/magisk")||strstr(p, "/data/adb/modules")||strstr(p, "/data/adb/modules_update")||strstr(p, "/data/adb/zygisk")||strstr(p, "/data/adb/.magisk")||strstr(p, "/data/adb/stealth")||strstr(p, "/data/adb/stealth_ultimate")||strstr(p, "/data/adb/post-fs-data.d")||strstr(p, "/data/adb/service.d")||strstr(p, "/data/adb/.core")||strstr(p, "/debug_ramdisk")||strstr(p, "/sbin/magisk")||strstr(p, "/data/adb/magisk.db")||strstr(p, "com.topjohnwu.magisk")||strstr(p, "io.github.vvb2060.magisk")||strstr(p, "/sbin/magiskd")||strstr(p, "/sbin/magiskinit")||strstr(p, "magisk_addon")||strstr(p, "magisk_pfsd")||strstr(p, "magisk_busybox")||strstr(p, "magiskexec")) return 1;
+    if (strstr(p, "/sbin/.magisk")||strstr(p, "/data/adb/magisk")||strstr(p, "/data/adb/modules")||strstr(p, "/data/adb/modules_update")||strstr(p, "/data/adb/zygisk")||strstr(p, "/data/adb/.magisk")||strstr(p, "/data/adb/stealth")||strstr(p, "/data/adb/stealth_ultimate")||strstr(p, "/data/adb/post-fs-data.d")||strstr(p, "/data/adb/service.d")||strstr(p, "/data/adb/.core")||strstr(p, "/debug_ramdisk")||strstr(p, "/sbin/magisk")||strstr(p, "/data/adb/magisk.db")||strstr(p, "com.topjohnwu.magisk")||strstr(p, "io.github.vvb2060.magisk")||strstr(p, "/sbin/magiskd")||strstr(p, "/sbin/magiskinit")||strstr(p, "magisk_addon")||strstr(p, "magisk_pfsd")||strstr(p, "magisk_busybox")||strstr(p, "magiskexec")||strstr(p, "/system/addon.d/99-magisk.sh")||strstr(p, "/system/etc/install-recovery.sh")||strstr(p, "/system/bin/install-recovery.sh")) return 1;
     /* KernelSU */
     if (strstr(p, "/data/adb/ksu")||strstr(p, "/data/adb/ksud")||strstr(p, "/debug_ramdisk/ksu")||strstr(p, "io.github.rifsxd.kernelsu")||strstr(p, "me.weishu.kernelsu")) return 1;
     /* APatch */
@@ -2447,7 +2473,7 @@ static void c_postAppSpecialize(void *impl, const void *args) {
 static void c_preServerSpecialize(void *impl, void *args) { (void)impl; (void)args; }
 static void c_postServerSpecialize(void *impl, const void *args) { (void)impl; (void)args; }
 
-__attribute__((visibility("default")))
+__attribute__((visibility("default"), used))
 void zygisk_module_entry(struct zygisk_api_table *table, void *env) {
     LOGI("=== MODULE ENTRY START ===");
     if (!table || !table->registerModule) {
