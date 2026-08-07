@@ -2524,66 +2524,86 @@ static int phdr_callback(struct dl_phdr_info *info, size_t size, void *data) {
     return 0;
 }
 
+static int g_plt_objects = 0;
+static int g_plt_registrations = 0;
+
+static void register_zygisk_hooks_for_object(long dev, long ino) {
+    if (!g_api || !g_api->pltHookRegister || dev == 0 || ino == 0) return;
+    g_api->pltHookRegister(dev, ino, "openat", (void*)openat, (void**)&real_openat);
+    g_api->pltHookRegister(dev, ino, "open", (void*)open, (void**)&real_open);
+    g_api->pltHookRegister(dev, ino, "access", (void*)access, (void**)&real_access);
+    g_api->pltHookRegister(dev, ino, "faccessat", (void*)faccessat, (void**)&real_faccessat);
+    g_api->pltHookRegister(dev, ino, "faccessat2", (void*)faccessat2, (void**)&real_faccessat2);
+    g_api->pltHookRegister(dev, ino, "stat", (void*)stat, (void**)&real_stat);
+    g_api->pltHookRegister(dev, ino, "lstat", (void*)lstat, (void**)&real_lstat);
+    g_api->pltHookRegister(dev, ino, "fstatat", (void*)fstatat, (void**)&real_fstatat);
+    g_api->pltHookRegister(dev, ino, "fstat", (void*)fstat, (void**)&real_fstat);
+    g_api->pltHookRegister(dev, ino, "readlink", (void*)readlink, (void**)&real_readlink);
+    g_api->pltHookRegister(dev, ino, "readlinkat", (void*)readlinkat, (void**)&real_readlinkat);
+    g_api->pltHookRegister(dev, ino, "readdir", (void*)readdir, (void**)&real_readdir);
+    g_api->pltHookRegister(dev, ino, "read", (void*)read, (void**)&real_read);
+    g_api->pltHookRegister(dev, ino, "close", (void*)close, (void**)&real_close);
+    g_api->pltHookRegister(dev, ino, "__system_property_get", (void*)__system_property_get, (void**)&real_prop_get);
+    g_api->pltHookRegister(dev, ino, "__system_property_find", (void*)__system_property_find, (void**)&real_prop_find);
+    g_api->pltHookRegister(dev, ino, "__system_property_read_callback", (void*)__system_property_read_callback, (void**)&real_prop_read_cb);
+    g_api->pltHookRegister(dev, ino, "__system_property_read", (void*)__system_property_read, (void**)&real_prop_read);
+    g_api->pltHookRegister(dev, ino, "uname", (void*)uname, (void**)&real_uname);
+    g_api->pltHookRegister(dev, ino, "ptrace", (void*)ptrace, (void**)&real_ptrace);
+    g_api->pltHookRegister(dev, ino, "prctl", (void*)prctl, (void**)&real_prctl);
+    g_api->pltHookRegister(dev, ino, "fopen", (void*)fopen, (void**)&real_fopen);
+    g_api->pltHookRegister(dev, ino, "fopen64", (void*)fopen64, (void**)&real_fopen64);
+    g_api->pltHookRegister(dev, ino, "fclose", (void*)fclose, (void**)&real_fclose);
+    g_api->pltHookRegister(dev, ino, "fread", (void*)fread, (void**)&real_fread);
+    g_api->pltHookRegister(dev, ino, "fgets", (void*)fgets, (void**)&real_fgets);
+    g_api->pltHookRegister(dev, ino, "getline", (void*)getline, (void**)&real_getline);
+    g_api->pltHookRegister(dev, ino, "syscall", (void*)syscall, (void**)&real_syscall);
+    g_api->pltHookRegister(dev, ino, "pread64", (void*)pread64, (void**)&real_pread64);
+    g_api->pltHookRegister(dev, ino, "getauxval", (void*)getauxval, (void**)&real_getauxval);
+    g_api->pltHookRegister(dev, ino, "fork", (void*)fork_hook, (void**)&real_fork);
+    g_api->pltHookRegister(dev, ino, "vfork", (void*)vfork_hook, (void**)&real_vfork);
+    g_api->pltHookRegister(dev, ino, "clone", (void*)clone_hook, (void**)&real_clone);
+    g_api->pltHookRegister(dev, ino, "execve", (void*)execve_hook, (void**)&real_execve);
+    g_api->pltHookRegister(dev, ino, "execveat", (void*)execveat_hook, (void**)&real_execveat);
+    g_api->pltHookRegister(dev, ino, "posix_spawn", (void*)posix_spawn_hook, (void**)&real_posix_spawn);
+    g_api->pltHookRegister(dev, ino, "getpid", (void*)getpid_hook, (void**)&real_getpid);
+    g_api->pltHookRegister(dev, ino, "getppid", (void*)getppid_hook, (void**)&real_getppid);
+    g_api->pltHookRegister(dev, ino, "socket", (void*)socket_hook, (void**)&real_socket);
+    g_api->pltHookRegister(dev, ino, "connect", (void*)connect_hook, (void**)&real_connect);
+    g_api->pltHookRegister(dev, ino, "recvmsg", (void*)recvmsg_hook, (void**)&real_recvmsg);
+    g_api->pltHookRegister(dev, ino, "sendmsg", (void*)sendmsg_hook, (void**)&real_sendmsg);
+    g_api->pltHookRegister(dev, ino, "getsockopt", (void*)getsockopt_hook, (void**)&real_getsockopt);
+    g_api->pltHookRegister(dev, ino, "setsockopt", (void*)setsockopt_hook, (void**)&real_setsockopt);
+    g_api->pltHookRegister(dev, ino, "bind", (void*)bind_hook, (void**)&real_bind);
+    g_api->pltHookRegister(dev, ino, "listen", (void*)listen_hook, (void**)&real_listen);
+    g_api->pltHookRegister(dev, ino, "getsockname", (void*)getsockname_hook, (void**)&real_getsockname);
+    g_api->pltHookRegister(dev, ino, "getpeername", (void*)getpeername_hook, (void**)&real_getpeername);
+    g_api->pltHookRegister(dev, ino, "dlsym", (void*)dlsym_hook, (void**)&real_dlsym);
+    g_api->pltHookRegister(dev, ino, "dlvsym", (void*)dlvsym_hook, (void**)&real_dlvsym);
+    g_api->pltHookRegister(dev, ino, "dladdr", (void*)dladdr_hook, (void**)&real_dladdr);
+    g_plt_registrations += 52;
+}
+
+static int register_plt_object_callback(struct dl_phdr_info *info, size_t size, void *data) {
+    (void)size; (void)data;
+    if (!info->dlpi_name || !info->dlpi_name[0] || strstr(info->dlpi_name, "stealth")) return 0;
+
+    struct stat st;
+    if (stat(info->dlpi_name, &st) != 0 || st.st_dev == 0 || st.st_ino == 0) return 0;
+
+    register_zygisk_hooks_for_object((long)st.st_dev, (long)st.st_ino);
+    g_plt_objects++;
+    return 0;
+}
+
 static void install_zygisk_plt_hooks(void) {
-    if (!g_api) return;
-    if (!g_api->pltHookRegister || !g_api->pltHookCommit) return;
+    if (!g_api || !g_api->pltHookRegister || !g_api->pltHookCommit) return;
 
-    /* dev=0, ino=0 means hook ALL libraries */
-    g_api->pltHookRegister(0, 0, "openat", (void*)openat, (void**)&real_openat);
-    g_api->pltHookRegister(0, 0, "open", (void*)open, (void**)&real_open);
-    g_api->pltHookRegister(0, 0, "access", (void*)access, (void**)&real_access);
-    g_api->pltHookRegister(0, 0, "faccessat", (void*)faccessat, (void**)&real_faccessat);
-    g_api->pltHookRegister(0, 0, "faccessat2", (void*)faccessat2, (void**)&real_faccessat2);
-    g_api->pltHookRegister(0, 0, "stat", (void*)stat, (void**)&real_stat);
-    g_api->pltHookRegister(0, 0, "lstat", (void*)lstat, (void**)&real_lstat);
-    g_api->pltHookRegister(0, 0, "fstatat", (void*)fstatat, (void**)&real_fstatat);
-    g_api->pltHookRegister(0, 0, "fstat", (void*)fstat, (void**)&real_fstat);
-    g_api->pltHookRegister(0, 0, "readlink", (void*)readlink, (void**)&real_readlink);
-    g_api->pltHookRegister(0, 0, "readlinkat", (void*)readlinkat, (void**)&real_readlinkat);
-    g_api->pltHookRegister(0, 0, "readdir", (void*)readdir, (void**)&real_readdir);
-    g_api->pltHookRegister(0, 0, "read", (void*)read, (void**)&real_read);
-    g_api->pltHookRegister(0, 0, "close", (void*)close, (void**)&real_close);
-    g_api->pltHookRegister(0, 0, "__system_property_get", (void*)__system_property_get, (void**)&real_prop_get);
-    g_api->pltHookRegister(0, 0, "__system_property_find", (void*)__system_property_find, (void**)&real_prop_find);
-    g_api->pltHookRegister(0, 0, "__system_property_read_callback", (void*)__system_property_read_callback, (void**)&real_prop_read_cb);
-    g_api->pltHookRegister(0, 0, "__system_property_read", (void*)__system_property_read, (void**)&real_prop_read);
-    g_api->pltHookRegister(0, 0, "uname", (void*)uname, (void**)&real_uname);
-    g_api->pltHookRegister(0, 0, "ptrace", (void*)ptrace, (void**)&real_ptrace);
-    g_api->pltHookRegister(0, 0, "prctl", (void*)prctl, (void**)&real_prctl);
-    g_api->pltHookRegister(0, 0, "fopen", (void*)fopen, (void**)&real_fopen);
-    g_api->pltHookRegister(0, 0, "fopen64", (void*)fopen64, (void**)&real_fopen64);
-    g_api->pltHookRegister(0, 0, "fclose", (void*)fclose, (void**)&real_fclose);
-    g_api->pltHookRegister(0, 0, "fread", (void*)fread, (void**)&real_fread);
-    g_api->pltHookRegister(0, 0, "fgets", (void*)fgets, (void**)&real_fgets);
-    g_api->pltHookRegister(0, 0, "getline", (void*)getline, (void**)&real_getline);
-    g_api->pltHookRegister(0, 0, "syscall", (void*)syscall, (void**)&real_syscall);
-    g_api->pltHookRegister(0, 0, "pread64", (void*)pread64, (void**)&real_pread64);
-    g_api->pltHookRegister(0, 0, "getauxval", (void*)getauxval, (void**)&real_getauxval);
-    g_api->pltHookRegister(0, 0, "fork", (void*)fork_hook, (void**)&real_fork);
-    g_api->pltHookRegister(0, 0, "vfork", (void*)vfork_hook, (void**)&real_vfork);
-    g_api->pltHookRegister(0, 0, "clone", (void*)clone_hook, (void**)&real_clone);
-    g_api->pltHookRegister(0, 0, "execve", (void*)execve_hook, (void**)&real_execve);
-    g_api->pltHookRegister(0, 0, "execveat", (void*)execveat_hook, (void**)&real_execveat);
-    g_api->pltHookRegister(0, 0, "posix_spawn", (void*)posix_spawn_hook, (void**)&real_posix_spawn);
-    g_api->pltHookRegister(0, 0, "getpid", (void*)getpid_hook, (void**)&real_getpid);
-    g_api->pltHookRegister(0, 0, "getppid", (void*)getppid_hook, (void**)&real_getppid);
-    g_api->pltHookRegister(0, 0, "socket", (void*)socket_hook, (void**)&real_socket);
-    g_api->pltHookRegister(0, 0, "connect", (void*)connect_hook, (void**)&real_connect);
-    g_api->pltHookRegister(0, 0, "recvmsg", (void*)recvmsg_hook, (void**)&real_recvmsg);
-    g_api->pltHookRegister(0, 0, "sendmsg", (void*)sendmsg_hook, (void**)&real_sendmsg);
-    g_api->pltHookRegister(0, 0, "getsockopt", (void*)getsockopt_hook, (void**)&real_getsockopt);
-    g_api->pltHookRegister(0, 0, "setsockopt", (void*)setsockopt_hook, (void**)&real_setsockopt);
-    g_api->pltHookRegister(0, 0, "bind", (void*)bind_hook, (void**)&real_bind);
-    g_api->pltHookRegister(0, 0, "listen", (void*)listen_hook, (void**)&real_listen);
-    g_api->pltHookRegister(0, 0, "getsockname", (void*)getsockname_hook, (void**)&real_getsockname);
-    g_api->pltHookRegister(0, 0, "getpeername", (void*)getpeername_hook, (void**)&real_getpeername);
-    g_api->pltHookRegister(0, 0, "dlsym", (void*)dlsym_hook, (void**)&real_dlsym);
-    g_api->pltHookRegister(0, 0, "dlvsym", (void*)dlvsym_hook, (void**)&real_dlvsym);
-    g_api->pltHookRegister(0, 0, "dladdr", (void*)dladdr_hook, (void**)&real_dladdr);
-    g_api->pltHookRegister(0, 0, "dlopen", (void*)dlopen_hook, (void**)&real_dlopen);
-
-    g_api->pltHookCommit();
-    LOGI("install_zygisk_plt_hooks: commit done");
+    g_plt_objects = 0;
+    g_plt_registrations = 0;
+    dl_iterate_phdr(register_plt_object_callback, NULL);
+    int committed = g_api->pltHookCommit();
+    LOGI("install_zygisk_plt_hooks: commit=%d objects=%d registrations=%d",
+         committed, g_plt_objects, g_plt_registrations);
 }
 
 static void install_got_hooks(void) {
@@ -2599,9 +2619,11 @@ static void install_got_hooks(void) {
         LOGE("install_got_hooks: Zygisk PLT not available");
     }
 
-    /* Fallback: manual GOT patching */
-    dl_iterate_phdr(phdr_callback, NULL);
-    LOGI("install_got_hooks: done");
+    /* The Zygisk API patches the selected loaded ELF objects. The old manual
+       fallback interpreted relocated DT_* pointers as offsets and could patch
+       invalid addresses, so do not run it after a supported API commit. */
+    LOGI("install_got_hooks: done objects=%d registrations=%d",
+         g_plt_objects, g_plt_registrations);
 }
 
 /* ══ ZYGISK ENTRY ══ */
