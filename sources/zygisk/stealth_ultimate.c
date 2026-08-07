@@ -270,6 +270,12 @@ static char s_display_id[64] = "UD1A.240105.004";
 static char s_characteristics[32] = "default";
 static char s_abilist32[64] = "";
 static char s_changelist[16] = "11207768";
+static char s_pixelprops_pi[32] = "1";
+static char s_pixelprops_gms[32] = "1";
+static char s_pixelprops_games[32] = "1";
+static char s_pixelprops_gapps[32] = "1";
+static char s_pixelprops_gphotos[32] = "1";
+static char s_pixelprops_netflix[32] = "1";
 
 /* System whitelist */
 static const char *WHITELIST[] = {
@@ -355,6 +361,8 @@ static int (*real_close)(int) = NULL;
 static int (*real_prop_get)(const char *, char *) = NULL;
 static const prop_info *(*real_prop_find)(const char *) = NULL;
 static void (*real_prop_read_cb)(const prop_info *, void (*)(void *, const char *, const char *, uint32_t), void *) = NULL;
+static int (*real_property_get)(const char *, char *, const char *) = NULL;
+static const prop_info *(*real_property_find)(const char *) = NULL;
 static int (*real_uname)(struct utsname *) = NULL;
 static long (*real_ptrace)(int, pid_t, void *, void *) = NULL;
 static int (*real_prctl)(int, ...) = NULL;
@@ -410,6 +418,8 @@ static void init_reals(void) {
     real_prop_get = dlsym(RTLD_NEXT, "__system_property_get");
     real_prop_find = dlsym(RTLD_NEXT, "__system_property_find");
     real_prop_read_cb = dlsym(RTLD_NEXT, "__system_property_read_callback");
+    real_property_get = dlsym(RTLD_NEXT, "property_get");
+    real_property_find = dlsym(RTLD_NEXT, "property_find");
     real_uname = dlsym(RTLD_NEXT, "uname");
     real_ptrace = dlsym(RTLD_NEXT, "ptrace");
     real_prctl = dlsym(RTLD_NEXT, "prctl");
@@ -545,8 +555,6 @@ static int should_hide_property(const char *name) {
     if (strncmp(name, "init.svc.ksu", 12) == 0) return 1;
     if (strncmp(name, "init.svc.apd", 12) == 0) return 1;
     if (strncmp(name, "init.svc.apatch", 15) == 0) return 1;
-    if (strstr(name, "persist.sys.pixelprops")) return 1;
-    if (strstr(name, "ro.boot.vbmeta")) return 1;
     if (strcmp(name, "ro.boot.veritymode") == 0) return 0; /* spoofed */
     if (strcmp(name, "ro.boot.verity_mode") == 0) return 0; /* spoofed */
     if (strcmp(name, "persist.sys.safetynet") == 0) return 0;
@@ -631,10 +639,14 @@ static int should_hide_mounts_line(const char *line) {
     if (strstr(line, "substrate")||strstr(line, "frida")||strstr(line, "gum-js-loop")||strstr(line, "linjector")) return 1;
     if (strstr(line, "re.frida.server")||strstr(line, "frida-server")) return 1;
     if (strstr(line, "zygisksu")||strstr(line, "zygisk_lsposed")||strstr(line, "zygisk-assistant")) return 1;
-    if (strstr(line, "peer") || strstr(line, "bind") || strstr(line, "tmpfs") || strstr(line, "overlay")) return 1;
-    if (strstr(line, "idmapped") || strstr(line, "shared") || strstr(line, "rprivate") || strstr(line, "rbind")) return 1;
+    if (strstr(line, "libnpatch")||strstr(line, "liblsplant")||strstr(line, "npatch")||strstr(line, "lspatch")) return 1;
+    if (strstr(line, ":69A2")||strstr(line, ":69A3")||strstr(line, "27042")||strstr(line, "27043")) return 1;
     if (strstr(line, "magisk_addon") || strstr(line, "magisk_pfsd") || strstr(line, "magisk_busybox") || strstr(line, "magiskexec")) return 1;
     if (strstr(line, "/system/addon.d") || strstr(line, "install-recovery")) return 1;
+    if (strstr(line, "magisk") && (strstr(line, "tmpfs") || strstr(line, "bind") || strstr(line, "overlay"))) return 1;
+    if (strstr(line, "zygisk") && (strstr(line, "tmpfs") || strstr(line, "bind") || strstr(line, "overlay"))) return 1;
+    if (strstr(line, "/data/adb/magisk") && (strstr(line, "tmpfs") || strstr(line, "bind"))) return 1;
+    if (strstr(line, "/data/adb/zygisk") && (strstr(line, "tmpfs") || strstr(line, "bind"))) return 1;
     return 0;
 }
 
@@ -1203,6 +1215,10 @@ static int is_hidden_entry(const char *name) {
     return 0;
 }
 
+/* Public property API forward declarations */
+int property_get(const char *key, char *value, const char *default_value);
+const prop_info *property_find(const char *key);
+
 static int is_whitelisted(const char *proc) {
     if (!proc || !proc[0]) return 0;
     for (int i = 0; WHITELIST[i]; i++) if (!strcmp(proc, WHITELIST[i])) return 1;
@@ -1297,6 +1313,14 @@ static const char *get_spoof(const char *name) {
     /* Locale / timezone */
     if (!strcmp(name, "persist.sys.locale")) return s_locale;
     if (!strcmp(name, "persist.sys.timezone")) return s_timezone;
+
+    /* Pixelprops / Play Integrity */
+    if (!strcmp(name, "persist.sys.pixelprops.pi")) return s_pixelprops_pi;
+    if (!strcmp(name, "persist.sys.pixelprops.gms")) return s_pixelprops_gms;
+    if (!strcmp(name, "persist.sys.pixelprops.games")) return s_pixelprops_games;
+    if (!strcmp(name, "persist.sys.pixelprops.gapps")) return s_pixelprops_gapps;
+    if (!strcmp(name, "persist.sys.pixelprops.gphotos")) return s_pixelprops_gphotos;
+    if (!strcmp(name, "persist.sys.pixelprops.netflix")) return s_pixelprops_netflix;
 
     /* GPU */
     if (!strcmp(name, "ro.opengles.version")) return s_opengles;
@@ -1416,6 +1440,12 @@ static void load_config(void) {
                  else CFG_STR("SPOOF_NOCHECKIN", s_nocheckin)
                  else CFG_STR("SPOOF_LCD_DENSITY", s_lcd_density)
                  else CFG_STR("SPOOF_SF_HW", s_sf_hw)
+                 else CFG_STR("SPOOF_PIXELPROPS_PI", s_pixelprops_pi)
+                 else CFG_STR("SPOOF_PIXELPROPS_GMS", s_pixelprops_gms)
+                 else CFG_STR("SPOOF_PIXELPROPS_GAMES", s_pixelprops_games)
+                 else CFG_STR("SPOOF_PIXELPROPS_GAPPS", s_pixelprops_gapps)
+                 else CFG_STR("SPOOF_PIXELPROPS_GPHOTOS", s_pixelprops_gphotos)
+                 else CFG_STR("SPOOF_PIXELPROPS_NETFLIX", s_pixelprops_netflix)
                  else CFG_STR("SPOOF_DISPLAY_ID", s_display_id)
                  else CFG_STR("SPOOF_CHARACTERISTICS", s_characteristics)
                  else CFG_STR("SPOOF_ABILIST32", s_abilist32)
@@ -1970,6 +2000,44 @@ void __system_property_read_callback(const prop_info *pi, void (*callback)(void 
     if (real_prop_read_cb) real_prop_read_cb(pi, callback, cookie);
 }
 
+/* Public property_get wrapper hook */
+int property_get(const char *key, char *value, const char *default_value) {
+    if (!real_property_get) init_reals(); if (!real_property_get) return -1;
+    if (!g_in_hook && g_hidden) {
+        g_in_hook = 1;
+        if (should_hide_property(key)) { LOGD("property_get: HIDDEN %s", key); g_in_hook = 0; return 0; }
+        const char *spoofed = get_spoof(key);
+        if (spoofed) { LOGD("property_get: SPOOF %s -> %s", key, spoofed); size_t len = strlen(spoofed); if (len > 91) len = 91; memcpy(value, spoofed, len); value[len] = 0; g_in_hook = 0; return (int)len; }
+        g_in_hook = 0;
+    }
+    int r = real_property_get(key, value, default_value);
+    if (r <= 0 && value && default_value && !g_in_hook && g_hidden) { size_t len = strlen(default_value); if (len > 91) len = 91; memcpy(value, default_value, len); value[len] = 0; return (int)len; }
+    return r;
+}
+
+/* Public property_find wrapper hook */
+const prop_info *property_find(const char *key) {
+    if (!real_property_find) init_reals();
+    if (!g_in_hook && g_hidden && key) {
+        g_in_hook = 1;
+        if (should_hide_property(key)) { g_in_hook = 0; return NULL; }
+        const char *spoofed = get_spoof(key);
+        if (spoofed) {
+            const prop_info *pi = real_property_find ? real_property_find(key) : NULL;
+            const prop_info *tp = pi ? pi : G_DUMMY_PI;
+            pthread_mutex_lock(&g_prop_mutex);
+            int slot = -1;
+            for (int i = 0; i < g_spoof_prop_count; i++) if (g_spoof_props[i].pi == tp) { slot = i; break; }
+            if (slot < 0 && g_spoof_prop_count < MAX_SPOOF_PROPS) slot = g_spoof_prop_count++;
+            if (slot >= 0) { g_spoof_props[slot].pi = tp; strncpy(g_spoof_props[slot].name, key, sizeof(g_spoof_props[slot].name)-1); g_spoof_props[slot].name[sizeof(g_spoof_props[slot].name)-1] = 0; }
+            pthread_mutex_unlock(&g_prop_mutex);
+            g_in_hook = 0; return tp;
+        }
+        g_in_hook = 0;
+    }
+    return real_property_find ? real_property_find(key) : NULL;
+}
+
 int uname(struct utsname *buf) {
     if (!real_uname) init_reals(); if (!real_uname) return -1;
     int r = real_uname(buf);
@@ -2182,6 +2250,8 @@ static void build_hook_table(void) {
     g_hook_table[i++] = (struct hook_entry){"__system_property_get", (void*)__system_property_get};
     g_hook_table[i++] = (struct hook_entry){"__system_property_find", (void*)__system_property_find};
     g_hook_table[i++] = (struct hook_entry){"__system_property_read_callback", (void*)__system_property_read_callback};
+    g_hook_table[i++] = (struct hook_entry){"property_get", (void*)property_get};
+    g_hook_table[i++] = (struct hook_entry){"property_find", (void*)property_find};
     g_hook_table[i++] = (struct hook_entry){"uname", (void*)uname};
     g_hook_table[i++] = (struct hook_entry){"ptrace", (void*)ptrace};
     g_hook_table[i++] = (struct hook_entry){"prctl", (void*)prctl};
@@ -2384,6 +2454,8 @@ static void install_zygisk_plt_hooks(void) {
     g_api->pltHookRegister(0, 0, "__system_property_get", (void*)__system_property_get, (void**)&real_prop_get);
     g_api->pltHookRegister(0, 0, "__system_property_find", (void*)__system_property_find, (void**)&real_prop_find);
     g_api->pltHookRegister(0, 0, "__system_property_read_callback", (void*)__system_property_read_callback, (void**)&real_prop_read_cb);
+    g_api->pltHookRegister(0, 0, "property_get", (void*)property_get, (void**)&real_property_get);
+    g_api->pltHookRegister(0, 0, "property_find", (void*)property_find, (void**)&real_property_find);
     g_api->pltHookRegister(0, 0, "uname", (void*)uname, (void**)&real_uname);
     g_api->pltHookRegister(0, 0, "ptrace", (void*)ptrace, (void**)&real_ptrace);
     g_api->pltHookRegister(0, 0, "prctl", (void*)prctl, (void**)&real_prctl);
