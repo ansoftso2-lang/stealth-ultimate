@@ -44,7 +44,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-#define LOG_PATH "/data/local/tmp/stealth_ultimate.log"
+#define LOG_PATH "/data/adb/stealth_ultimate/stealth_ultimate.log"
 #define LOG_BUF_SIZE 1024
 static volatile int g_logging = 0;
 
@@ -58,14 +58,24 @@ static void log_write(const char *fmt, ...) {
     va_end(ap);
     if (n <= 0) { g_logging = 0; return; }
     if (n > (int)sizeof(buf)) n = (int)sizeof(buf);
-    /* Use raw syscalls to bypass our own openat/close/write hooks
-       (LOG_PATH is under /data/adb which we hide from target apps). */
 #ifdef __NR_openat
     int fd = (int)syscall(__NR_openat, AT_FDCWD, LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0644);
 #else
     int fd = -1;
 #endif
-    if (fd < 0) { g_logging = 0; return; }
+    if (fd < 0) {
+        buf[n] = 0;
+#ifdef __NR_openat
+        int fd2 = (int)syscall(__NR_openat, AT_FDCWD, "/data/local/tmp/stealth_ultimate_fallback.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd2 >= 0) {
+            syscall(__NR_write, fd2, buf, n);
+            syscall(__NR_write, fd2, "\n", 1);
+            syscall(__NR_close, fd2);
+        }
+#endif
+        g_logging = 0;
+        return;
+    }
 #ifdef __NR_write
     syscall(__NR_write, fd, buf, n);
     syscall(__NR_write, fd, "\n", 1);
