@@ -1966,12 +1966,14 @@ const prop_info *__system_property_find(const char *name) {
     if (!real_prop_find) init_reals();
     if (!g_in_hook && g_hidden && name) {
         g_in_hook = 1;
+        LOGD("__system_property_find: enter name=%s hidden=%d", name, g_hidden);
         /* Hide blacklisted properties — return NULL */
-        if (should_hide_property(name)) { g_in_hook = 0; return NULL; }
+        if (should_hide_property(name)) { LOGD("prop_find: HIDDEN %s", name); g_in_hook = 0; return NULL; }
         if (cfg_spoof) {
             const char *spoofed = get_spoof(name);
             const prop_info *pi = real_prop_find ? real_prop_find(name) : NULL;
             if (spoofed) {
+                LOGD("prop_find: SPOOF %s -> %s", name, spoofed);
                 const prop_info *tp = pi ? pi : G_DUMMY_PI;
                 pthread_mutex_lock(&g_prop_mutex);
                 int slot = -1;
@@ -1981,6 +1983,7 @@ const prop_info *__system_property_find(const char *name) {
                 pthread_mutex_unlock(&g_prop_mutex);
                 g_in_hook = 0; return tp;
             }
+            LOGD("__system_property_find: not-spoofed name=%s", name);
         }
         g_in_hook = 0;
     }
@@ -2024,9 +2027,11 @@ const prop_info *property_find(const char *key) {
     if (!real_property_find) init_reals();
     if (!g_in_hook && g_hidden && key) {
         g_in_hook = 1;
-        if (should_hide_property(key)) { g_in_hook = 0; return NULL; }
+        LOGD("property_find: enter key=%s hidden=%d", key, g_hidden);
+        if (should_hide_property(key)) { LOGD("property_find: HIDDEN %s", key); g_in_hook = 0; return NULL; }
         const char *spoofed = get_spoof(key);
         if (spoofed) {
+            LOGD("property_find: SPOOF %s -> %s", key, spoofed);
             const prop_info *pi = real_property_find ? real_property_find(key) : NULL;
             const prop_info *tp = pi ? pi : G_DUMMY_PI;
             pthread_mutex_lock(&g_prop_mutex);
@@ -2037,6 +2042,7 @@ const prop_info *property_find(const char *key) {
             pthread_mutex_unlock(&g_prop_mutex);
             g_in_hook = 0; return tp;
         }
+        LOGD("property_find: not-spoofed key=%s", key);
         g_in_hook = 0;
     }
     return real_property_find ? real_property_find(key) : NULL;
