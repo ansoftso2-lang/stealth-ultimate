@@ -102,7 +102,7 @@ jobs:
           git config --global user.name "GitHub Action"
           git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
           git checkout main || git checkout master
-          git add stealth_ultimate.zip
+          git add -f stealth_ultimate.zip
           if git diff --cached --quiet; then
             echo "No changes to commit"
           else
