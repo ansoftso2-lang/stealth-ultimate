@@ -1264,7 +1264,7 @@ static void determine_hidden(void) {
 
 /* get_spoof — enhanced for Play Integrity */
 static const char *get_spoof(const char *name) {
-    if (!name || !g_hidden || !cfg_spoof) return NULL;
+    if (!name || !g_hidden || !cfg_spoof) { LOGD("get_spoof: skip name=%s hidden=%d cfg=%d", name ? name : "null", g_hidden, cfg_spoof); return NULL; }
 
     /* Fingerprints — all partitions must be consistent */
     if (!strcmp(name, "ro.build.fingerprint")||!strcmp(name, "ro.system.build.fingerprint")||!strcmp(name, "ro.vendor.build.fingerprint")||!strcmp(name, "ro.odm.build.fingerprint")||!strcmp(name, "ro.bootimage.build.fingerprint")||!strcmp(name, "ro.system_ext.build.fingerprint")||!strcmp(name, "ro.product.build.fingerprint")||!strcmp(name, "ro.product.system.build.fingerprint")||!strcmp(name, "ro.product.vendor.build.fingerprint")||!strcmp(name, "ro.product.odm.build.fingerprint")||!strcmp(name, "ro.product.system_ext.build.fingerprint")) return s_fp;
@@ -1943,9 +1943,11 @@ int __system_property_get(const char *name, char *value) {
     if (!real_prop_get) init_reals(); if (!real_prop_get) return 0;
     if (!g_in_hook && g_hidden) {
         g_in_hook = 1;
+        LOGD("__system_property_get: enter name=%s hidden=%d", name, g_hidden);
         if (should_hide_property(name)) { LOGD("prop_get: HIDDEN %s", name); g_in_hook = 0; return 0; }
         const char *spoofed = get_spoof(name);
         if (spoofed) { LOGD("prop_get: SPOOF %s -> %s", name, spoofed); size_t len = strlen(spoofed); if (len > 91) len = 91; memcpy(value, spoofed, len); value[len] = 0; g_in_hook = 0; return (int)len; }
+        LOGD("__system_property_get: not-spoofed name=%s", name);
         g_in_hook = 0;
     }
     return real_prop_get(name, value);
@@ -2005,9 +2007,11 @@ int property_get(const char *key, char *value, const char *default_value) {
     if (!real_property_get) init_reals(); if (!real_property_get) return -1;
     if (!g_in_hook && g_hidden) {
         g_in_hook = 1;
+        LOGD("property_get: enter key=%s hidden=%d", key, g_hidden);
         if (should_hide_property(key)) { LOGD("property_get: HIDDEN %s", key); g_in_hook = 0; return 0; }
         const char *spoofed = get_spoof(key);
         if (spoofed) { LOGD("property_get: SPOOF %s -> %s", key, spoofed); size_t len = strlen(spoofed); if (len > 91) len = 91; memcpy(value, spoofed, len); value[len] = 0; g_in_hook = 0; return (int)len; }
+        LOGD("property_get: not-spoofed key=%s", key);
         g_in_hook = 0;
     }
     int r = real_property_get(key, value, default_value);
