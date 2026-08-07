@@ -209,7 +209,7 @@ static unsigned int g_zygisk_flags = 0;
 #define ZYGISK_PROCESS_ON_DENYLIST 2u
 
 static __thread int g_in_hook = 0;
-static int g_in_init = 0;
+static __thread int g_in_init = 0;
 
 static int g_hidden = 0;
 static char g_proc[256] = {0};
@@ -359,6 +359,7 @@ static int (*real_openat)(int, const char *, int, ...) = NULL;
 static int (*real_open)(const char *, int, ...) = NULL;
 static int (*real_access)(const char *, int) = NULL;
 static int (*real_faccessat)(int, const char *, int, int) = NULL;
+static int (*real_faccessat2)(int, const char *, int, int) = NULL;
 static int (*real_stat)(const char *, struct stat *) = NULL;
 static int (*real_lstat)(const char *, struct stat *) = NULL;
 static int (*real_fstatat)(int, const char *, struct stat *, int) = NULL;
@@ -417,6 +418,7 @@ static void init_reals(void) {
     real_open = dlsym(RTLD_NEXT, "open");
     real_access = dlsym(RTLD_NEXT, "access");
     real_faccessat = dlsym(RTLD_NEXT, "faccessat");
+    real_faccessat2 = dlsym(RTLD_NEXT, "faccessat2");
     real_stat = dlsym(RTLD_NEXT, "stat");
     real_lstat = dlsym(RTLD_NEXT, "lstat");
     real_fstatat = dlsym(RTLD_NEXT, "fstatat");
@@ -687,15 +689,18 @@ static int should_hide_unix_line(const char *line) {
 
 static void filter_maps_buffer(char *buf, ssize_t *n) {
     if (!buf || *n <= 0) return;
-    char tmp[32768]; size_t off = 0;
+    size_t tmpsz = (size_t)*n + 4096;
+    char *tmp = (char *)malloc(tmpsz); if (!tmp) return;
+    size_t off = 0;
     char *line = buf, *end = buf + *n;
     while (line < end) {
         char *eol = memchr(line, '\n', end - line);
         size_t len = eol ? (size_t)(eol - line) : (size_t)(end - line);
-        if (!should_hide_maps_line(line)) { if (off + len + 1 <= sizeof(tmp)) { memcpy(tmp + off, line, len); off += len; if (eol) tmp[off++] = '\n'; } }
+        if (!should_hide_maps_line(line)) { if (off + len + 1 <= tmpsz) { memcpy(tmp + off, line, len); off += len; if (eol) tmp[off++] = '\n'; } }
         if (!eol) break; line = eol + 1;
     }
     if (off < (size_t)*n) { memcpy(buf, tmp, off); *n = (ssize_t)off; }
+    free(tmp);
 }
 
 /* smaps: each region begins with an address line (hex digits).
@@ -880,9 +885,9 @@ static void filter_net_tcp_buffer(char *buf, ssize_t *n) {
         char *eol = memchr(line, '\n', end - line);
         size_t len = eol ? (size_t)(eol - line) : (size_t)(end - line);
         int hide = 0;
-        if (strstr(line, "00000000:") || strstr(line, "00000000:0")) {
-            if (strstr(line, "magisk") || strstr(line, "zygisk") || strstr(line, "stealth")) hide = 1;
-        }
+        /* /proc/net/tcp lines are hex addresses — no process names.
+           Hide Frida ports 27042 (0x69A2) and 27043 (0x69A3). */
+        if (strstr(line, ":69A2") || strstr(line, ":69A3") || strstr(line, ":69a2") || strstr(line, ":69a3")) hide = 1;
         if (!hide && off + len + 1 <= sizeof(tmp)) { memcpy(tmp + off, line, len); off += len; if (eol) tmp[off++] = '\n'; }
         if (!eol) break; line = eol + 1;
     }
@@ -897,7 +902,8 @@ static void filter_net_udp_buffer(char *buf, ssize_t *n) {
         char *eol = memchr(line, '\n', end - line);
         size_t len = eol ? (size_t)(eol - line) : (size_t)(end - line);
         int hide = 0;
-        if (strstr(line, "magisk") || strstr(line, "zygisk") || strstr(line, "stealth")) hide = 1;
+        /* /proc/net/udp lines are hex addresses — hide Frida ports. */
+        if (strstr(line, ":69A2") || strstr(line, ":69A3") || strstr(line, ":69a2") || strstr(line, ":69a3")) hide = 1;
         if (!hide && off + len + 1 <= sizeof(tmp)) { memcpy(tmp + off, line, len); off += len; if (eol) tmp[off++] = '\n'; }
         if (!eol) break; line = eol + 1;
     }
@@ -977,13 +983,17 @@ static enum ProcFdType classify_proc_path(const char *path) {
         if (strstr(path, "/exe")) return FD_TYPE_EXE;
         if (strstr(path, "/root")) return FD_TYPE_ROOT;
         if (strstr(path, "/fd/")) return FD_TYPE_FD;
-        if (strstr(path, "/stat")) return FD_TYPE_STAT;
+        if (strstr(path, "/stat")) {
+            /* Avoid matching /statm, /statx etc. — only match /stat at end of path */
+            const char *sp = strstr(path, "/stat");
+            if (sp[4] == '\0' || sp[4] == ' ') return FD_TYPE_STAT;
+        }
         if (strstr(path, "/io")) return FD_TYPE_IO;
         if (strstr(path, "/limits")) return FD_TYPE_LIMITS;
-        if (strstr(path, "/net/tcp")) return FD_TYPE_NET_TCP;
         if (strstr(path, "/net/tcp6")) return FD_TYPE_NET_TCP6;
-        if (strstr(path, "/net/udp")) return FD_TYPE_NET_UDP;
+        if (strstr(path, "/net/tcp")) return FD_TYPE_NET_TCP;
         if (strstr(path, "/net/udp6")) return FD_TYPE_NET_UDP6;
+        if (strstr(path, "/net/udp")) return FD_TYPE_NET_UDP;
     }
     if (strstr(path, "/proc/net/unix")) return FD_TYPE_UNIX;
     if (strcmp(path, "/sys/fs/selinux/enforce") == 0) return FD_TYPE_SELINUX_ENFORCE;
@@ -1526,6 +1536,12 @@ int faccessat(int dirfd, const char *path, int mode, int flags) {
     return real_faccessat(dirfd, path, mode, flags);
 }
 
+int faccessat2(int dirfd, const char *path, int mode, int flags) {
+    if (!g_in_hook && g_hidden) { g_in_hook = 1; if (!real_faccessat2) init_reals(); if (is_hidden_path(path)) { g_in_hook = 0; errno = ENOENT; return -1; } if (cfg_spoof_selinux_file && path && strcmp(path, "/sys/fs/selinux/enforce") == 0) { g_in_hook = 0; return 0; } g_in_hook = 0; }
+    if (!real_faccessat2) init_reals(); if (!real_faccessat2) return syscall(SYS_faccessat2, dirfd, path, mode, flags);
+    return real_faccessat2(dirfd, path, mode, flags);
+}
+
 int stat(const char *path, struct stat *st) {
     if (!g_in_hook && g_hidden) { g_in_hook = 1; if (!real_stat) init_reals(); if (is_hidden_path(path)) { g_in_hook = 0; errno = ENOENT; return -1; } if (cfg_spoof_selinux_file && path && strcmp(path, "/sys/fs/selinux/enforce") == 0 && st) { memset(st, 0, sizeof(*st)); st->st_mode = S_IFREG|0644; st->st_size = 2; st->st_nlink = 1; g_in_hook = 0; return 0; } g_in_hook = 0; }
     if (!real_stat) init_reals(); if (!real_stat) { errno = ENOSYS; return -1; }
@@ -1659,6 +1675,20 @@ ssize_t pread64(int fd, void *buf, size_t count, off64_t offset) {
             }
             g_in_hook = 1; filter_proc_buffer(type, (char *)buf, &n); g_in_hook = 0;
         }
+        else {
+            /* Classify untracked FDs (same as read hook) */
+            g_in_hook = 1;
+            char fp[256]; fp[0] = 0;
+            get_fd_path(fd, fp, sizeof(fp));
+            if (fp[0]) {
+                enum ProcFdType pt = classify_proc_path(fp);
+                if (pt != FD_TYPE_NONE) {
+                    add_tracked_fd(fd, pt);
+                    filter_proc_buffer(pt, (char *)buf, &n);
+                }
+            }
+            g_in_hook = 0;
+        }
     }
     return n;
 }
@@ -1782,11 +1812,25 @@ pid_t fork_hook(void) {
     return real_fork ? real_fork() : -1;
 }
 
+pid_t vfork_hook(void) {
+    if (!real_vfork) init_reals();
+    /* vfork: child shares parent's stack. Do NOT call LOGI/getpid here —
+       only the parent may safely execute code before the child calls _exit/execve. */
+    return real_vfork ? real_vfork() : -1;
+}
+
 int clone_hook(int (*fn)(void *), void *child_stack, int flags, ...) {
     if (!real_clone) init_reals();
-    LOGI("clone: flags=%d", flags);
-    va_list ap; va_start(ap, flags); void *arg = va_arg(ap, void *); va_end(ap);
-    return real_clone ? real_clone(fn, child_stack, flags, arg) : -1;
+    va_list ap; va_start(ap, flags);
+    void *arg = va_arg(ap, void *);
+    void *parent_tidptr = va_arg(ap, void *);
+    void *tls = va_arg(ap, void *);
+    void *child_tidptr = va_arg(ap, void *);
+    va_end(ap);
+    if (!real_clone) return -1;
+    /* clone() has variable args — pass all 7 to the real function.
+       Extra args are ignored by clone if not needed. */
+    return real_clone(fn, child_stack, flags, arg, parent_tidptr, tls, child_tidptr);
 }
 
 int execve_hook(const char *pathname, char *const argv[], char *const envp[]) {
@@ -1824,15 +1868,15 @@ int posix_spawn_hook(pid_t *pid, const char *path, void *actions, void *attr, ch
 
 pid_t getpid_hook(void) {
     if (!real_getpid) init_reals();
-    pid_t pid = real_getpid ? real_getpid() : getpid();
-    LOGD("getpid: %d", pid);
+    /* NEVER call getpid() as fallback — it's hooked to us → infinite recursion.
+       Use raw syscall instead. */
+    pid_t pid = real_getpid ? real_getpid() : (pid_t)raw_syscall(__NR_getpid, 0, 0, 0, 0, 0, 0);
     return pid;
 }
 
 pid_t getppid_hook(void) {
     if (!real_getppid) init_reals();
-    pid_t ppid = real_getppid ? real_getppid() : getppid();
-    LOGD("getppid: %d", ppid);
+    pid_t ppid = real_getppid ? real_getppid() : (pid_t)raw_syscall(__NR_getppid, 0, 0, 0, 0, 0, 0);
     return ppid;
 }
 
@@ -1944,10 +1988,13 @@ int dladdr_hook(const void *addr, void *info) {
 }
 
 void *dlopen_hook(const char *name, int flags) {
-    void *h = NULL;
+    if (!g_in_hook && g_hidden && name) {
+        g_in_hook = 1;
+        if (is_hidden_path(name)) { g_in_hook = 0; errno = ENOENT; return NULL; }
+        g_in_hook = 0;
+    }
     if (!real_dlopen) init_reals();
-    h = real_dlopen ? real_dlopen(name, flags) : dlopen(name, flags);
-    return h;
+    return real_dlopen ? real_dlopen(name, flags) : dlopen(name, flags);
 }
 
 /* __system_property_get — FIXED: 2 params + property blacklist */
@@ -2280,6 +2327,7 @@ static void build_hook_table(void) {
     g_hook_table[i++] = (struct hook_entry){"open", (void*)open};
     g_hook_table[i++] = (struct hook_entry){"access", (void*)access};
     g_hook_table[i++] = (struct hook_entry){"faccessat", (void*)faccessat};
+    g_hook_table[i++] = (struct hook_entry){"faccessat2", (void*)faccessat2};
     g_hook_table[i++] = (struct hook_entry){"stat", (void*)stat};
     g_hook_table[i++] = (struct hook_entry){"lstat", (void*)lstat};
     g_hook_table[i++] = (struct hook_entry){"fstatat", (void*)fstatat};
@@ -2293,8 +2341,6 @@ static void build_hook_table(void) {
     g_hook_table[i++] = (struct hook_entry){"__system_property_find", (void*)__system_property_find};
     g_hook_table[i++] = (struct hook_entry){"__system_property_read_callback", (void*)__system_property_read_callback};
     g_hook_table[i++] = (struct hook_entry){"__system_property_read", (void*)__system_property_read};
-    g_hook_table[i++] = (struct hook_entry){"property_get", (void*)property_get};
-    g_hook_table[i++] = (struct hook_entry){"property_find", (void*)property_find};
     g_hook_table[i++] = (struct hook_entry){"uname", (void*)uname};
     g_hook_table[i++] = (struct hook_entry){"ptrace", (void*)ptrace};
     g_hook_table[i++] = (struct hook_entry){"prctl", (void*)prctl};
@@ -2308,7 +2354,7 @@ static void build_hook_table(void) {
     g_hook_table[i++] = (struct hook_entry){"pread64", (void*)pread64};
     g_hook_table[i++] = (struct hook_entry){"getauxval", (void*)getauxval};
     g_hook_table[i++] = (struct hook_entry){"fork", (void*)fork_hook};
-    g_hook_table[i++] = (struct hook_entry){"vfork", (void*)fork_hook};
+    g_hook_table[i++] = (struct hook_entry){"vfork", (void*)vfork_hook};
     g_hook_table[i++] = (struct hook_entry){"clone", (void*)clone_hook};
     g_hook_table[i++] = (struct hook_entry){"execve", (void*)execve_hook};
     g_hook_table[i++] = (struct hook_entry){"execveat", (void*)execveat_hook};
@@ -2485,6 +2531,7 @@ static void install_zygisk_plt_hooks(void) {
     g_api->pltHookRegister(0, 0, "open", (void*)open, (void**)&real_open);
     g_api->pltHookRegister(0, 0, "access", (void*)access, (void**)&real_access);
     g_api->pltHookRegister(0, 0, "faccessat", (void*)faccessat, (void**)&real_faccessat);
+    g_api->pltHookRegister(0, 0, "faccessat2", (void*)faccessat2, (void**)&real_faccessat2);
     g_api->pltHookRegister(0, 0, "stat", (void*)stat, (void**)&real_stat);
     g_api->pltHookRegister(0, 0, "lstat", (void*)lstat, (void**)&real_lstat);
     g_api->pltHookRegister(0, 0, "fstatat", (void*)fstatat, (void**)&real_fstatat);
@@ -2498,8 +2545,6 @@ static void install_zygisk_plt_hooks(void) {
     g_api->pltHookRegister(0, 0, "__system_property_find", (void*)__system_property_find, (void**)&real_prop_find);
     g_api->pltHookRegister(0, 0, "__system_property_read_callback", (void*)__system_property_read_callback, (void**)&real_prop_read_cb);
     g_api->pltHookRegister(0, 0, "__system_property_read", (void*)__system_property_read, (void**)&real_prop_read);
-    g_api->pltHookRegister(0, 0, "property_get", (void*)property_get, (void**)&real_property_get);
-    g_api->pltHookRegister(0, 0, "property_find", (void*)property_find, (void**)&real_property_find);
     g_api->pltHookRegister(0, 0, "uname", (void*)uname, (void**)&real_uname);
     g_api->pltHookRegister(0, 0, "ptrace", (void*)ptrace, (void**)&real_ptrace);
     g_api->pltHookRegister(0, 0, "prctl", (void*)prctl, (void**)&real_prctl);
@@ -2513,7 +2558,7 @@ static void install_zygisk_plt_hooks(void) {
     g_api->pltHookRegister(0, 0, "pread64", (void*)pread64, (void**)&real_pread64);
     g_api->pltHookRegister(0, 0, "getauxval", (void*)getauxval, (void**)&real_getauxval);
     g_api->pltHookRegister(0, 0, "fork", (void*)fork_hook, (void**)&real_fork);
-    g_api->pltHookRegister(0, 0, "vfork", (void*)fork_hook, (void**)&real_fork);
+    g_api->pltHookRegister(0, 0, "vfork", (void*)vfork_hook, (void**)&real_vfork);
     g_api->pltHookRegister(0, 0, "clone", (void*)clone_hook, (void**)&real_clone);
     g_api->pltHookRegister(0, 0, "execve", (void*)execve_hook, (void**)&real_execve);
     g_api->pltHookRegister(0, 0, "execveat", (void*)execveat_hook, (void**)&real_execveat);
@@ -2569,9 +2614,10 @@ static void c_preAppSpecialize(void *impl, void *args) {
     (void)impl; (void)args;
     LOGI("preAppSpecialize: start");
     init_reals();
+    load_root_uids();
     load_config();
     if (g_api && g_api->getFlags) {
-        g_zygisk_flags = g_api->getFlags(impl);
+        g_zygisk_flags = g_api->getFlags(g_module_abi.impl);
     }
     LOGI("preAppSpecialize: flags=%u", g_zygisk_flags);
 }

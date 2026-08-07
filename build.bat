@@ -7,6 +7,9 @@ cd /d "%~dp0"
 
 if not "%~1"=="" set "GH_TOKEN=%~1"
 if not defined GH_TOKEN if defined STEALTH_GITHUB_TOKEN set "GH_TOKEN=%STEALTH_GITHUB_TOKEN%"
+if not defined GH_TOKEN if exist ".github-token" (
+  set /p "GH_TOKEN="<".github-token"
+)
 
 where git >nul 2>nul || (
   echo [ERROR] Git is not installed or is not in PATH.
@@ -25,7 +28,7 @@ if not defined GH_TOKEN (
   gh auth status >nul 2>nul || (
     echo [ERROR] GitHub authentication is required.
     echo Usage: build.bat YOUR_GITHUB_TOKEN
-    echo Or set STEALTH_GITHUB_TOKEN once and run build.bat without arguments.
+    echo Or set STEALTH_GITHUB_TOKEN, authenticate with gh, or put the token in .github-token.
     exit /b 1
   )
 )
