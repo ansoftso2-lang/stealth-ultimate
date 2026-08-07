@@ -2591,6 +2591,7 @@ static void c_postServerSpecialize(void *impl, const void *args) { (void)impl; (
 __attribute__((visibility("default"), used))
 void zygisk_module_entry(struct zygisk_api_table *table, void *env) {
     LOGI("=== MODULE ENTRY START ===");
+    LOGI("module_entry: LOG_PATH=%s", LOG_PATH);
     if (!table || !table->registerModule) {
         LOGE("module_entry: invalid table");
         return;
