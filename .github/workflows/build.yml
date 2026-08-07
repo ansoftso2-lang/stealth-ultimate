@@ -56,15 +56,17 @@ jobs:
           cp sources/zygisk/armeabi-v7a.so build/zygisk/
           cp sources/zygisk/x86.so build/zygisk/
           cp sources/zygisk/x86_64.so build/zygisk/
-          cp sources/module/module.prop build/module.prop
+          python3 - <<'PY'
+          from pathlib import Path
+          source = Path('sources/module/module.prop').read_text(encoding='utf-8-sig')
+          Path('build/module.prop').write_text(source.replace('\r\n', '\n'), encoding='utf-8', newline='\n')
+          PY
           cp sources/shell/*.sh build/
           cp sources/shell/common/stealth.conf.default build/common/
+          sed -i 's/\r$//' build/*.sh build/common/stealth.conf.default
           chmod 0755 build/*.sh
           chmod 0644 build/module.prop build/common/stealth.conf.default build/zygisk/*.so
-          test "$(od -An -tx1 -N3 build/module.prop | tr -d ' \n')" != "efbbbf" || {
-            echo "module.prop contains a UTF-8 BOM"
-            exit 1
-          }
+          test "$(od -An -tx1 -N3 build/module.prop | tr -d ' \n')" != "efbbbf"
           (cd build && zip -q -r ../stealth_ultimate.zip .)
 
       - name: Validate installable ZIP
