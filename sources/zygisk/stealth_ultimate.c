@@ -361,6 +361,7 @@ static int (*real_close)(int) = NULL;
 static int (*real_prop_get)(const char *, char *) = NULL;
 static const prop_info *(*real_prop_find)(const char *) = NULL;
 static void (*real_prop_read_cb)(const prop_info *, void (*)(void *, const char *, const char *, uint32_t), void *) = NULL;
+static int (*real_prop_read)(const prop_info *, char *, char *) = NULL;
 static int (*real_property_get)(const char *, char *, const char *) = NULL;
 static const prop_info *(*real_property_find)(const char *) = NULL;
 static int (*real_uname)(struct utsname *) = NULL;
@@ -418,6 +419,7 @@ static void init_reals(void) {
     real_prop_get = dlsym(RTLD_NEXT, "__system_property_get");
     real_prop_find = dlsym(RTLD_NEXT, "__system_property_find");
     real_prop_read_cb = dlsym(RTLD_NEXT, "__system_property_read_callback");
+    real_prop_read = dlsym(RTLD_NEXT, "__system_property_read");
     real_property_get = dlsym(RTLD_NEXT, "property_get");
     real_property_find = dlsym(RTLD_NEXT, "property_find");
     real_uname = dlsym(RTLD_NEXT, "uname");
@@ -2005,6 +2007,26 @@ void __system_property_read_callback(const prop_info *pi, void (*callback)(void 
     if (real_prop_read_cb) real_prop_read_cb(pi, callback, cookie);
 }
 
+/* __system_property_read — intercept low-level prop read */
+int __system_property_read(const prop_info *pi, char *name, char *value) {
+    if (!real_prop_read) init_reals(); if (!real_prop_read) return 0;
+    if (!g_in_hook && g_hidden && cfg_spoof && pi) {
+        g_in_hook = 1;
+        const char *mn = NULL;
+        pthread_mutex_lock(&g_prop_mutex);
+        for (int i = 0; i < g_spoof_prop_count; i++) if (g_spoof_props[i].pi == pi) { mn = g_spoof_props[i].name; break; }
+        pthread_mutex_unlock(&g_prop_mutex);
+        if (pi == G_DUMMY_PI && mn) {
+            const char *sp = get_spoof(mn);
+            if (name && mn) { size_t len = strlen(mn); if (len > 91) len = 91; memcpy(name, mn, len); name[len] = 0; }
+            if (value && sp) { size_t len = strlen(sp); if (len > 91) len = 91; memcpy(value, sp, len); value[len] = 0; }
+            g_in_hook = 0; return 1;
+        }
+        g_in_hook = 0;
+    }
+    return real_prop_read(pi, name, value);
+}
+
 /* Public property_get wrapper hook */
 int property_get(const char *key, char *value, const char *default_value) {
     if (!real_property_get) init_reals(); if (!real_property_get) return -1;
@@ -2260,6 +2282,7 @@ static void build_hook_table(void) {
     g_hook_table[i++] = (struct hook_entry){"__system_property_get", (void*)__system_property_get};
     g_hook_table[i++] = (struct hook_entry){"__system_property_find", (void*)__system_property_find};
     g_hook_table[i++] = (struct hook_entry){"__system_property_read_callback", (void*)__system_property_read_callback};
+    g_hook_table[i++] = (struct hook_entry){"__system_property_read", (void*)__system_property_read};
     g_hook_table[i++] = (struct hook_entry){"property_get", (void*)property_get};
     g_hook_table[i++] = (struct hook_entry){"property_find", (void*)property_find};
     g_hook_table[i++] = (struct hook_entry){"uname", (void*)uname};
@@ -2464,6 +2487,7 @@ static void install_zygisk_plt_hooks(void) {
     g_api->pltHookRegister(0, 0, "__system_property_get", (void*)__system_property_get, (void**)&real_prop_get);
     g_api->pltHookRegister(0, 0, "__system_property_find", (void*)__system_property_find, (void**)&real_prop_find);
     g_api->pltHookRegister(0, 0, "__system_property_read_callback", (void*)__system_property_read_callback, (void**)&real_prop_read_cb);
+    g_api->pltHookRegister(0, 0, "__system_property_read", (void*)__system_property_read, (void**)&real_prop_read);
     g_api->pltHookRegister(0, 0, "property_get", (void*)property_get, (void**)&real_property_get);
     g_api->pltHookRegister(0, 0, "property_find", (void*)property_find, (void**)&real_property_find);
     g_api->pltHookRegister(0, 0, "uname", (void*)uname, (void**)&real_uname);
