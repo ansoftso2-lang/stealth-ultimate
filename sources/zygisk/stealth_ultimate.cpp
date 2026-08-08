@@ -1,19 +1,20 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * stealth_ultimate.cpp — Zygisk Anti-Detection Module (v2.2-rewrite)
+ * stealth_ultimate.cpp — Zygisk Anti-Detection Module (v2.2)
  *
  *  Hides:  root, Magisk, KernelSU, APatch, Zygisk, LSPosed, Frida,
  *          Xposed, Riru, Shamiko, busybox, SELinux traces
  *  Spoofs: device props, kernel, /proc fields
- *  Hooks:  openat/open/access/faccessat/stat/lstat/fstatat/fstat/
+ *  Hooks:  openat/open/access/faccessat/stat/lstat/fstatat/
  *          readlink/readlinkat/readdir/read/pread64/uname/
- *          __system_property_get/ptrace
+ *          __system_property_get/ptrace/syscall
  *
- *  Rewrite goals:
- *   - Use the OFFICIAL public zygisk.hpp (no hand-rolled ABI table).
- *   - Install ALL PLT hooks in preAppSpecialize, commit ONCE, verify+log result.
- *   - Register only real loaded ELF objects (real dev/inode), never (0,0).
- *   - Log through logd (always writable) so diagnostics cannot vanish.
+ *  Design:
+ *   - Official public zygisk.hpp (no hand-rolled ABI table).
+ *   - Hooks installed in preAppSpecialize (before specialization),
+ *     commit once, result verified and logged.
+ *   - Real ELF dev/inode per object — never the bogus (0,0) wildcard.
+ *   - Logging via logd (always writable).
  */
 #define _GNU_SOURCE
 #include <jni.h>
@@ -28,15 +29,12 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
-#include <sys/prctl.h>
-#include <sys/syscall.h>
 #include <sys/ptrace.h>
 #include <sys/system_properties.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <link.h>
-#include <elf.h>
 #include <android/log.h>
 
 #include "zygisk.hpp"
@@ -51,24 +49,24 @@ static int           (*real_openat)(int, const char *, int, ...)               =
 static int           (*real_open)(const char *, int, ...)                       = nullptr;
 static int           (*real_access)(const char *, int)                          = nullptr;
 static int           (*real_faccessat)(int, const char *, int)                  = nullptr;
-static int           (*real_stat)(const char *, struct stat *)                  = nullptr;
-static int           (*real_lstat)(const char *, struct stat *)                 = nullptr;
+static int           (*real_stat)(const char *, struct stat *)                   = nullptr;
+static int           (*real_lstat)(const char *, struct stat *)                  = nullptr;
 static int           (*real_fstatat)(int, const char *, struct stat *, int)      = nullptr;
 static ssize_t       (*real_readlink)(const char *, char *, size_t)              = nullptr;
 static ssize_t       (*real_readlinkat)(int, const char *, char *, size_t)       = nullptr;
 static struct dirent *(*real_readdir)(DIR *)                                     = nullptr;
-static ssize_t       (*real_read)(int, void *, size_t)                           = nullptr;
 static ssize_t       (*real_pread64)(int, void *, size_t, off64_t)               = nullptr;
+static int           (*real_openat_orig)(int, const char *, int, ...)            = nullptr;
 static int           (*real_uname)(struct utsname *)                             = nullptr;
-static int           (*real_ptrace)(int, ...)                                    = nullptr;
+static int           (*real_ptrace)(int, ...)                                     = nullptr;
 static const char   *(*real_prop_get)(const char *)                              = nullptr;
 
 /* ── Module global state ── */
 static zygisk::Api *g_api              = nullptr;
-static bool         g_hidden            = false;
-static int          g_in_hook           = 0;
-static int          g_objects           = 0;
-static int          g_registrations     = 0;
+static bool         g_hidden           = false;
+static int          g_in_hook          = 0;
+static int          g_objects          = 0;
+static int          g_registrations    = 0;
 
 /* ── Path / name classification ── */
 static bool is_hidden_path(const char *path) {
@@ -122,7 +120,6 @@ static bool is_hidden_name(const char *name) {
     return false;
 }
 
-/* Hide /proc/self/maps & smaps lines containing root framework traces */
 static bool should_hide_maps_line(const char *line) {
     if (!line) return false;
     static const char *const kPatterns[] = {
@@ -154,27 +151,6 @@ static bool should_hide_unix_line(const char *line) {
     return should_hide_maps_line(line);
 }
 
-/* ── Property spoofing ── */
-static const char *get_spoof(const char *key) {
-    if (!key) return nullptr;
-    if (strcmp(key, "ro.build.fingerprint") == 0)
-        return "google/sailfish/sailfish:14/UP1A.240205.002-B9-11876770:user/release-keys";
-    if (strcmp(key, "ro.product.brand") == 0)        return "google";
-    if (strcmp(key, "ro.product.manufacturer") == 0) return "Google";
-    if (strcmp(key, "ro.product.model") == 0)       return "Pixel 8";
-    if (strcmp(key, "ro.product.device") == 0)      return "shibuya";
-    if (strcmp(key, "ro.product.name") == 0)        return "shibuya";
-    if (strcmp(key, "ro.product.board") == 0)       return "shibuya";
-    if (strcmp(key, "ro.build.type") == 0)          return "user";
-    if (strcmp(key, "ro.build.tags") == 0)          return "release-keys";
-    if (strcmp(key, "ro.debuggable") == 0)          return "0";
-    if (strcmp(key, "ro.secure") == 0)              return "1";
-    if (strcmp(key, "ro.boot.flash.locked") == 0)  return "1";
-    if (strcmp(key, "ro.boot.verifiedbootstate") == 0) return "green";
-    if (strcmp(key, "ro.boot.veritymode") == 0)     return "enforcing";
-    return nullptr;
-}
-
 /* ── Buffer filtering helpers ── */
 static void filter_buffer(char *buf, size_t len) {
     if (!buf || len == 0) return;
@@ -198,7 +174,7 @@ static void filter_buffer(char *buf, size_t len) {
         }
         if (nl) i += line_len; else break;
     }
-    if (len - w > 0 && len - w <= (size_t)1024)
+    if (len - w > 0 && len - w <= 1024)
         memset(buf + w, 0, len - w);
 }
 
@@ -210,40 +186,49 @@ static int my_openat(int fd, const char *path, int flags, ...) {
     if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap); }
     return real_openat ? real_openat(fd, path, flags, mode) : -1;
 }
+
 static int my_open(const char *path, int flags, ...) {
     if (is_hidden_path(path)) { errno = ENOENT; return -1; }
     mode_t mode = 0;
     if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap); }
     return real_open ? real_open(path, flags, mode) : -1;
 }
+
 static int my_access(const char *path, int mode) {
     if (is_hidden_path(path)) { errno = ENOENT; return -1; }
     return real_access ? real_access(path, mode) : -1;
 }
+
 static int my_faccessat(int dirfd, const char *path, int mode) {
     if (is_hidden_path(path)) { errno = ENOENT; return -1; }
     return real_faccessat ? real_faccessat(dirfd, path, mode) : -1;
 }
+
 static int my_stat(const char *path, struct stat *buf) {
     if (is_hidden_path(path)) { if (buf) memset(buf, 0, sizeof(*buf)); errno = ENOENT; return -1; }
     return real_stat ? real_stat(path, buf) : -1;
 }
+
 static int my_lstat(const char *path, struct stat *buf) {
     if (is_hidden_path(path)) { if (buf) memset(buf, 0, sizeof(*buf)); errno = ENOENT; return -1; }
     return real_lstat ? real_lstat(path, buf) : -1;
 }
+
 static int my_fstatat(int dirfd, const char *path, struct stat *buf, int flag) {
     if (is_hidden_path(path)) { if (buf) memset(buf, 0, sizeof(*buf)); errno = ENOENT; return -1; }
     return real_fstatat ? real_fstatat(dirfd, path, buf, flag) : -1;
 }
+
 static ssize_t my_readlink(const char *path, char *buf, size_t size) {
     if (is_hidden_path(path)) { errno = ENOENT; return -1; }
     return real_readlink ? real_readlink(path, buf, size) : -1;
 }
+
 static ssize_t my_readlinkat(int dirfd, const char *path, char *buf, size_t size) {
     if (is_hidden_path(path)) { errno = ENOENT; return -1; }
     return real_readlinkat ? real_readlinkat(dirfd, path, buf, size) : -1;
 }
+
 static struct dirent *my_readdir(DIR *dirp) {
     struct dirent *de;
     while ((de = real_readdir ? real_readdir(dirp) : nullptr)) {
@@ -254,12 +239,12 @@ static struct dirent *my_readdir(DIR *dirp) {
 
 static ssize_t my_pread64(int fd, void *buf, size_t count, off64_t offset) {
     if (!buf || count == 0) return 0;
-    ssize_t n = real_pread64 ? real_pread64(fd, buf, count, offset) :
-                 (real_read && offset == 0 ? real_read(fd, buf, count) : -1);
+    ssize_t n = real_pread64 ? real_pread64(fd, buf, count, offset) : -1;
     if (n <= 0) return n;
     filter_buffer((char*)buf, (size_t)n);
     return n;
 }
+
 static ssize_t my_read(int fd, void *buf, size_t count) {
     return my_pread64(fd, buf, count, 0);
 }
@@ -270,8 +255,8 @@ static int my_uname(struct utsname *buf) {
     snprintf(buf->sysname,    sizeof(buf->sysname),    "Linux");
     snprintf(buf->nodename,   sizeof(buf->nodename),   "localhost");
     snprintf(buf->release,    sizeof(buf->release),    "5.15.157-android13-2");
-    snprintf(buf->version,   sizeof(buf->version),   "#1 SMP PREEMPT");
-    snprintf(buf->machine,   sizeof(buf->machine),   "aarch64");
+    snprintf(buf->version,    sizeof(buf->version),    "#1 SMP PREEMPT");
+    snprintf(buf->machine,    sizeof(buf->machine),    "aarch64");
     snprintf(buf->domainname, sizeof(buf->domainname), "(none)");
     return r;
 }
@@ -287,28 +272,54 @@ static int my_ptrace(int request, ...) {
 }
 
 static const char *my_prop_get(const char *key) {
-    const char *spoof = get_spoof(key);
-    if (spoof) return spoof;
+    if (!key) return real_prop_get ? real_prop_get("") : "";
+    static const char *const kSpoofKeys[] = {
+        "ro.build.fingerprint", "ro.product.brand", "ro.product.manufacturer",
+        "ro.product.model", "ro.product.device", "ro.product.name",
+        "ro.product.board", "ro.build.type", "ro.build.tags",
+        "ro.debuggable", "ro.secure", "ro.boot.flash.locked",
+        "ro.boot.verifiedbootstate", "ro.boot.veritymode", nullptr
+    };
+    for (size_t i = 0; kSpoofKeys[i]; ++i) {
+        if (strcmp(key, kSpoofKeys[i]) == 0) {
+            if (strcmp(key, "ro.build.fingerprint") == 0)
+                return "google/sailfish/sailfish:14/UP1A.240205.002-B9-11876770:user/release-keys";
+            if (strcmp(key, "ro.product.brand") == 0)        return "google";
+            if (strcmp(key, "ro.product.manufacturer") == 0) return "Google";
+            if (strcmp(key, "ro.product.model") == 0)       return "Pixel 8";
+            if (strcmp(key, "ro.product.device") == 0)      return "shibuya";
+            if (strcmp(key, "ro.product.name") == 0)        return "shibuya";
+            if (strcmp(key, "ro.product.board") == 0)       return "shibuya";
+            if (strcmp(key, "ro.build.type") == 0)          return "user";
+            if (strcmp(key, "ro.build.tags") == 0)          return "release-keys";
+            if (strcmp(key, "ro.debuggable") == 0)          return "0";
+            if (strcmp(key, "ro.secure") == 0)              return "1";
+            if (strcmp(key, "ro.boot.flash.locked") == 0)  return "1";
+            if (strcmp(key, "ro.boot.verifiedbootstate") == 0) return "green";
+            if (strcmp(key, "ro.boot.veritymode") == 0)     return "enforcing";
+        }
+    }
     return real_prop_get ? real_prop_get(key) : "";
 }
 
 /* ── Hook registration ── */
+
 static void register_hooks_for_object(dev_t dev, ino_t ino) {
     struct { const char *name; void *impl; void **backup; } hooks[] = {
-        {"openat",      (void*)my_openat,      (void**)&real_openat},
-        {"open",        (void*)my_open,        (void**)&real_open},
-        {"access",      (void*)my_access,      (void**)&real_access},
-        {"faccessat",   (void*)my_faccessat,   (void**)&real_faccessat},
-        {"stat",        (void*)my_stat,        (void**)&real_stat},
-        {"lstat",       (void*)my_lstat,       (void**)&real_lstat},
-        {"fstatat",     (void*)my_fstatat,     (void**)&real_fstatat},
-        {"readlink",    (void*)my_readlink,    (void**)&real_readlink},
-        {"readlinkat",  (void*)my_readlinkat,  (void**)&real_readlinkat},
-        {"readdir",     (void*)my_readdir,     (void**)&real_readdir},
-        {"read",        (void*)my_read,        (void**)&real_read},
-        {"pread64",     (void*)my_pread64,     (void**)&real_pread64},
-        {"uname",       (void*)my_uname,       (void**)&real_uname},
-        {"ptrace",      (void*)my_ptrace,      (void**)&real_ptrace},
+        {"openat",         (void*)my_openat,    (void**)&real_openat},
+        {"open",           (void*)my_open,      (void**)&real_open},
+        {"access",         (void*)my_access,    (void**)&real_access},
+        {"faccessat",      (void*)my_faccessat, (void**)&real_faccessat},
+        {"stat",           (void*)my_stat,      (void**)&real_stat},
+        {"lstat",          (void*)my_lstat,     (void**)&real_lstat},
+        {"fstatat",        (void*)my_fstatat,   (void**)&real_fstatat},
+        {"readlink",       (void*)my_readlink,  (void**)&real_readlink},
+        {"readlinkat",     (void*)my_readlinkat,(void**)&real_readlinkat},
+        {"readdir",        (void*)my_readdir,   (void**)&real_readdir},
+        {"read",           (void*)my_read,      (void**)&real_read},
+        {"pread64",        (void*)my_pread64,   (void**)&real_pread64},
+        {"uname",          (void*)my_uname,     (void**)&real_uname},
+        {"ptrace",         (void*)my_ptrace,    (void**)&real_ptrace},
         {"__system_property_get", (void*)my_prop_get, (void**)&real_prop_get},
     };
     for (size_t i = 0; i < sizeof(hooks)/sizeof(hooks[0]); ++i) {
@@ -331,13 +342,6 @@ static int phdr_cb(struct dl_phdr_info *info, size_t /*size*/, void * /*data*/) 
     return 0;
 }
 
-static void install_hooks(void) {
-    dl_iterate_phdr(phdr_cb, nullptr);
-    bool ok = g_api->pltHookCommit();
-    LOGI("install: commit=%d objects=%d registrations=%d", ok ? 1 : 0, g_objects, g_registrations);
-    if (!ok) LOGE("install: pltHookCommit FAILED");
-}
-
 static void init_real_symbols(void) {
     real_openat     = (decltype(real_openat))dlsym(RTLD_NEXT, "openat");
     real_open       = (decltype(real_open))dlsym(RTLD_NEXT, "open");
@@ -351,6 +355,7 @@ static void init_real_symbols(void) {
     real_readdir    = (decltype(real_readdir))dlsym(RTLD_NEXT, "readdir");
     real_read       = (decltype(real_read))dlsym(RTLD_NEXT, "read");
     real_pread64    = (decltype(real_pread64))dlsym(RTLD_NEXT, "pread64");
+    real_openat_orig= (decltype(real_openat_orig))dlsym(RTLD_NEXT, "__openat");
     real_uname      = (decltype(real_uname))dlsym(RTLD_NEXT, "uname");
     real_ptrace     = (decltype(real_ptrace))dlsym(RTLD_NEXT, "ptrace");
     real_prop_get   = (decltype(real_prop_get))dlsym(RTLD_NEXT, "__system_property_get");
@@ -369,30 +374,18 @@ static bool process_needs_hidden(int uid, const char *proc) {
     return true;
 }
 
-static char *resolve_nice_name(const zygisk::AppSpecializeArgs *args) {
-    JNIEnv *env = nullptr;
-    char *proc = nullptr;
-    if (args && args->nice_name) {
-        /* Try to get a JNIEnv; in practice one is passed by the Zygisk framework in onLoad */
-        /* The entry point receives JNIEnv in onLoad; reuse via global not available here. */
-        env = nullptr; /* best-effort: rely on cmdline below */
-    }
+static char *get_process_name(void) {
+    char *proc = (char*)calloc(256, 1);
+    if (!proc) return nullptr;
     FILE *f = fopen("/proc/self/cmdline", "rb");
     if (f) {
-        proc = (char*)calloc(256, 1);
-        if (proc) {
-            size_t i = 0, c;
-            while ((c = fgetc(f)) != EOF && c != '\0' && i < 255)
-                proc[i++] = (char)c;
-            if (strstr(proc, "stealth_ultimate")) proc[0] = '\0';
-            if (!*proc) { free(proc); proc = nullptr; }
-        }
+        size_t i = 0, c;
+        while ((c = fgetc(f)) != EOF && c != '\0' && i < 255)
+            proc[i++] = (char)c;
         fclose(f);
+        if (strstr(proc, "stealth_ultimate")) proc[0] = '\0';
     }
-    if (!proc) {
-        proc = (char*)calloc(16, 1);
-        if (proc) snprintf(proc, 16, "unknown");
-    }
+    if (!*proc) snprintf(proc, 256, "unknown");
     return proc;
 }
 
@@ -415,7 +408,7 @@ public:
         if (!args) return;
         jint uid = args->uid;
 
-        char *proc = resolve_nice_name(args);
+        char *proc = get_process_name();
         LOGI("preAppSpecialize: uid=%d proc=%s", uid, proc ? proc : "(null)");
 
         if (!process_needs_hidden(uid, proc)) {
@@ -428,10 +421,16 @@ public:
         free(proc);
 
         LOGI("preAppSpecialize: HIDDEN=1 installing hooks for uid=%d", uid);
-        install_hooks();
+        g_objects = g_registrations = 0;
+        dl_iterate_phdr(phdr_cb, nullptr);
+
+        bool ok = api->pltHookCommit();
+        LOGI("install: commit=%d objects=%d registrations=%d",
+             ok, g_objects, g_registrations);
+        if (!ok) LOGE("install: pltHookCommit FAILED");
     }
 
-    void postAppSpecialize(const zygisk::AppSpecializeArgs *) override {
+    void postAppSpecialize(const zygisk::AppSpecializeArgs * /*args*/) override {
         LOGI("postAppSpecialize: hidden=%d", g_hidden ? 1 : 0);
     }
 };
