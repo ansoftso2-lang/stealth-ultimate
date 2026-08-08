@@ -352,7 +352,6 @@ static void init_real_symbols(void) {
     real_readlink   = (decltype(real_readlink))dlsym(RTLD_NEXT, "readlink");
     real_readlinkat = (decltype(real_readlinkat))dlsym(RTLD_NEXT, "readlinkat");
     real_readdir    = (decltype(real_readdir))dlsym(RTLD_NEXT, "readdir");
-    real_read       = (decltype(real_read))dlsym(RTLD_NEXT, "read");
     real_pread64    = (decltype(real_pread64))dlsym(RTLD_NEXT, "pread64");
     real_uname      = (decltype(real_uname))dlsym(RTLD_NEXT, "uname");
     real_ptrace     = (decltype(real_ptrace))dlsym(RTLD_NEXT, "ptrace");
