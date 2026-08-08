@@ -56,7 +56,6 @@ static ssize_t       (*real_readlink)(const char *, char *, size_t)             
 static ssize_t       (*real_readlinkat)(int, const char *, char *, size_t)       = nullptr;
 static struct dirent *(*real_readdir)(DIR *)                                     = nullptr;
 static ssize_t       (*real_pread64)(int, void *, size_t, off64_t)               = nullptr;
-static int           (*real_openat_orig)(int, const char *, int, ...)            = nullptr;
 static int           (*real_uname)(struct utsname *)                             = nullptr;
 static int           (*real_ptrace)(int, ...)                                     = nullptr;
 static const char   *(*real_prop_get)(const char *)                              = nullptr;
@@ -316,7 +315,7 @@ static void register_hooks_for_object(dev_t dev, ino_t ino) {
         {"readlink",       (void*)my_readlink,  (void**)&real_readlink},
         {"readlinkat",     (void*)my_readlinkat,(void**)&real_readlinkat},
         {"readdir",        (void*)my_readdir,   (void**)&real_readdir},
-        {"read",           (void*)my_read,      (void**)&real_read},
+        {"read",           (void*)my_read,      (void**)&real_pread64},
         {"pread64",        (void*)my_pread64,   (void**)&real_pread64},
         {"uname",          (void*)my_uname,     (void**)&real_uname},
         {"ptrace",         (void*)my_ptrace,    (void**)&real_ptrace},
@@ -355,7 +354,6 @@ static void init_real_symbols(void) {
     real_readdir    = (decltype(real_readdir))dlsym(RTLD_NEXT, "readdir");
     real_read       = (decltype(real_read))dlsym(RTLD_NEXT, "read");
     real_pread64    = (decltype(real_pread64))dlsym(RTLD_NEXT, "pread64");
-    real_openat_orig= (decltype(real_openat_orig))dlsym(RTLD_NEXT, "__openat");
     real_uname      = (decltype(real_uname))dlsym(RTLD_NEXT, "uname");
     real_ptrace     = (decltype(real_ptrace))dlsym(RTLD_NEXT, "ptrace");
     real_prop_get   = (decltype(real_prop_get))dlsym(RTLD_NEXT, "__system_property_get");
