@@ -71,7 +71,13 @@ jobs:
           PY
           cp sources/shell/*.sh build/
           cp sources/shell/common/stealth.conf.default build/common/
-          sed -i 's/\r$//; s/\xe2\x80\x94/--/g; s/\xe2\x80\x93/-/g; s/\xe2\x80\x98/`/g; s/\xe2\x80\x99/'/g; s/\xe2\x80\x9c/"/g; s/\xe2\x80\x9d/"/g' build/*.sh build/common/stealth.conf.default
+          sed -i 's/\r$//' build/*.sh build/common/stealth.conf.default
+          sed -i 's/\xe2\x80\x94/--/g' build/*.sh build/common/stealth.conf.default
+          sed -i 's/\xe2\x80\x93/-/g' build/*.sh build/common/stealth.conf.default
+          sed -i 's/\xe2\x80\x9c/"/g' build/*.sh build/common/stealth.conf.default
+          sed -i 's/\xe2\x80\x9d/"/g' build/*.sh build/common/stealth.conf.default
+          sed -i 's/\xe2\x80\x98/'"'"'/g' build/*.sh build/common/stealth.conf.default
+          sed -i 's/\xe2\x80\x99/'"'"'/g' build/*.sh build/common/stealth.conf.default
           chmod 0755 build/*.sh
           chmod 0644 build/module.prop build/common/stealth.conf.default build/zygisk/*.so
           test "$(od -An -tx1 -N3 build/module.prop | tr -d ' \n')" != "efbbbf"
