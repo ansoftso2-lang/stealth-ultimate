@@ -1,4 +1,4 @@
-#!/system/bin/sh
+﻿#!/system/bin/sh
 # service.sh v2.2 — Optional post-boot: refresh root UID list.
 MODDIR=${0%/*}
 DATA_DIR="/data/adb/stealth_ultimate"
