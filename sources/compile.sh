@@ -49,9 +49,9 @@ compile_arch() {
 }
 
 rm -f "$OUT_DIR"/*.so
-compile_arch "$PREBUILT/bin/aarch64-linux-android${API}-clang" arm64-v8a
-compile_arch "$PREBUILT/bin/armv7a-linux-androideabi${API}-clang" armeabi-v7a
-compile_arch "$PREBUILT/bin/i686-linux-android${API}-clang" x86
-compile_arch "$PREBUILT/bin/x86_64-linux-android${API}-clang" x86_64
+compile_arch "$PREBUILT/bin/aarch64-linux-android${API}-clang++" arm64-v8a
+compile_arch "$PREBUILT/bin/armv7a-linux-androideabi${API}-clang++" armeabi-v7a
+compile_arch "$PREBUILT/bin/i686-linux-android${API}-clang++" x86
+compile_arch "$PREBUILT/bin/x86_64-linux-android${API}-clang++" x86_64
 
 echo "All native libraries built successfully."
