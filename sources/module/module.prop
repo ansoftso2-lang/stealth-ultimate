@@ -1,7 +1,7 @@
 ﻿id=stealth_ultimate
 name=Stealth Ultimate
-version=v2.1
-versionCode=210
+version=v2.2
+versionCode=220
 author=stealth
 description=Zygisk anti-detection module with root framework hiding and device property spoofing.
 minMagisk=24000

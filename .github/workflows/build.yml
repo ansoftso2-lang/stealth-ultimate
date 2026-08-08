@@ -25,7 +25,7 @@ jobs:
           path: android-ndk-r27b
           key: ndk-r27b-${{ runner.os }}
 
-      - name: Install NDK r27b
+       - name: Install NDK r27b
         if: steps.ndk-cache.outputs.cache-hit != 'true'
         run: |
           rm -rf android-ndk-r27b android-ndk-r27b-linux.zip
@@ -33,6 +33,15 @@ jobs:
           unzip -q android-ndk-r27b-linux.zip
           rm -f android-ndk-r27b-linux.zip
         timeout-minutes: 10
+
+       - name: Fetch official zygisk.hpp
+        run: |
+          if [ ! -f sources/zygisk/zygisk.hpp ]; then
+            wget -q -O sources/zygisk/zygisk.hpp \
+              https://raw.githubusercontent.com/topjohnwu/zygisk-module-sample/master/module/jni/zygisk.hpp
+          fi
+          head -5 sources/zygisk/zygisk.hpp
+
 
       - name: Build native libraries
         env:
@@ -74,9 +83,9 @@ jobs:
         run: |
           test -s stealth_ultimate.zip
           for file in \
-            module.prop customize.sh post-fs-data.sh service.sh \
+            module.prop customize.sh post-fs-data.sh service.sh uninstall.sh \
             zygisk/arm64-v8a.so zygisk/armeabi-v7a.so \
-            zygisk/x86.so zygisk/x86_64.so; do
+            zygisk/x86.so zygisk/x86_64.so common/stealth.conf.default; do
             unzip -Z1 stealth_ultimate.zip | grep -Fx "$file" >/dev/null || {
               echo "Missing from stealth_ultimate.zip: $file"
               exit 1

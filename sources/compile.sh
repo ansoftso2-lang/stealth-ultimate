@@ -4,10 +4,13 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC="$SCRIPT_DIR/zygisk/stealth_ultimate.c"
+SRC="$SCRIPT_DIR/zygisk/stealth_ultimate.cpp"
 OUT_DIR="$SCRIPT_DIR/zygisk"
 NDK="${NDK_HOME:-${ANDROID_NDK_HOME:-}}"
 API=24
+
+# The official zygisk.hpp is a local header in the same folder as the source.
+INCLUDE_FLAGS=(-I"$SCRIPT_DIR/zygisk")
 
 [[ -f "$SRC" ]] || { echo "Source file not found: $SRC" >&2; exit 1; }
 [[ -n "$NDK" && -d "$NDK" ]] || { echo "Android NDK not found. Set NDK_HOME." >&2; exit 1; }
@@ -22,6 +25,7 @@ COMMON_FLAGS=(
     -O2
     -fPIC
     -shared
+    -std=c++17
     -Wall
     -Wextra
     -Wl,--hash-style=both
@@ -29,7 +33,7 @@ COMMON_FLAGS=(
     -Wl,-z,now
     -Wl,-z,noexecstack
 )
-LIBS=(-lc -ldl)
+LIBS=(-lc -ldl -landroid-log)
 
 compile_arch() {
     local compiler="$1"
@@ -38,7 +42,7 @@ compile_arch() {
 
     [[ -x "$compiler" ]] || { echo "Compiler not found: $compiler" >&2; exit 1; }
     echo "Compiling $abi with $(basename "$compiler")..."
-    "$compiler" "${COMMON_FLAGS[@]}" -o "$output" "$SRC" "${LIBS[@]}"
+    "$compiler" "${INCLUDE_FLAGS[@]}" "${COMMON_FLAGS[@]}" -o "$output" "$SRC" "${LIBS[@]}"
     [[ -s "$output" ]] || { echo "Compiler produced no output: $output" >&2; exit 1; }
     file "$output"
     ls -lh "$output"

@@ -1,9 +1,9 @@
 #!/system/bin/sh
-# customize.sh v1.1 — Installation script
+# customize.sh v2.2 — Installation-time checks and config copy.
 SKIPUNZIP=0
 
 ui_print " ================================"
-ui_print "  Stealth Ultimate v1.1"
+ui_print "  Stealth Ultimate v2.2"
 ui_print "  Zygisk Anti-Detection"
 ui_print " ================================"
 ui_print ""
@@ -11,40 +11,26 @@ ui_print ""
 [ -z "$MAGISK_VER_CODE" ] && { ui_print "! Need Magisk 24+"; abort; }
 ui_print "- Magisk: $MAGISK_VER_CODE"
 
-if [ "$ZYGISK_ENABLED" != "1" ]; then
-    ui_print "  ! Zygisk DISABLED"
-    ui_print "  ! Enable: Magisk Settings -> Zygisk -> Enable"
-    abort
-else
-    ui_print "  ✓ Zygisk ENABLED"
-fi
+[ "$ZYGISK_ENABLED" != "1" ] && { ui_print "  ! Zygisk DISABLED"; abort; } || ui_print "  ✓ Zygisk ENABLED"
 
 ARCH=$(getprop ro.product.cpu.abi)
-ui_print "- CPU: $ARCH"
+ui_print "- CPU ABI: $ARCH"
 
 ui_print "- Installing..."
-mkdir -p /data/adb/stealth_ultimate
-mkdir -p /cache/stealth_ultimate
-
-cp "$MODPATH/common/stealth.conf.default" /data/adb/stealth_ultimate/stealth.conf 2>/dev/null
-cp "$MODPATH/common/stealth.conf.default" /cache/stealth_ultimate/stealth.conf 2>/dev/null
-chmod 644 /data/adb/stealth_ultimate/stealth.conf 2>/dev/null
-chmod 644 /cache/stealth_ultimate/stealth.conf 2>/dev/null
+mkdir -p /data/adb/stealth_ultimate 2>/dev/null
 
 SO_FOUND=0
 for arch in arm64-v8a armeabi-v7a x86 x86_64; do
     if [ -f "$MODPATH/zygisk/$arch.so" ]; then
-        ui_print "  ✓ $arch.so ($(du -h "$MODPATH/zygisk/$arch.so" | cut -f1))"
+        ui_print "  ✓ $arch.so"
         SO_FOUND=1
-    else
-        ui_print "  ! $arch.so missing"
     fi
 done
+[ "$SO_FOUND" = "0" ] && { ui_print "  ✗ No .so files!"; abort; }
 
-if [ "$SO_FOUND" = "0" ]; then
-    ui_print "  ✗ No .so files! Run compile.sh with NDK first."
-    abort
-fi
+[ ! -f "$DATA_DIR/stealth.conf" ] && \
+    cp -f "$MODPATH/common/stealth.conf.default" "$DATA_DIR/stealth.conf" 2>/dev/null
+chmod 644 "$DATA_DIR/stealth.conf" 2>/dev/null
 
 set_perm_recursive "$MODPATH" 0 0 0755 0644
 
