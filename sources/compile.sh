@@ -33,7 +33,7 @@ COMMON_FLAGS=(
     -Wl,-z,now
     -Wl,-z,noexecstack
 )
-LIBS=(-lc -ldl -landroid-log)
+LIBS=(-lc -ldl)
 
 compile_arch() {
     local compiler="$1"
