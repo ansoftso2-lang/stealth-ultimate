@@ -1,4 +1,4 @@
-﻿#!/system/bin/sh
+#!/system/bin/sh
 # customize.sh v2.2 — Installation-time checks and config copy.
 SKIPUNZIP=0
 
