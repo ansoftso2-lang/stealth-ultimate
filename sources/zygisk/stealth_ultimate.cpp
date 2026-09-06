@@ -29,6 +29,9 @@
 #include <arpa/inet.h>
 #include <link.h>
 #include <stdarg.h>
+#include <sys/vfs.h>
+#include <sys/statvfs.h>
+#include <mntent.h>
 
 #include "zygisk.hpp"
 
@@ -71,6 +74,11 @@ static DIR            *(*real_opendir)(const char *)                            
 static DIR            *(*real_fdopendir)(int)                                    = nullptr;
 static int            (*real_scandir)(const char *, struct dirent ***,
         int (*)(const struct dirent *), int (*)(const struct dirent **, const struct dirent **)) = nullptr;
+static int            (*real_statfs)(const char *, struct statfs *)              = nullptr;
+static int            (*real_statvfs)(const char *, struct statvfs *)            = nullptr;
+static FILE           *(*real_setmntent)(const char *, const char *)              = nullptr;
+static struct mntent  *(*real_getmntent)(FILE *)                                 = nullptr;
+static void           *(*real_dlopen)(const char *, int)                          = nullptr;
 
 /* ── Module global state ── */
 static zygisk::Api *g_api = nullptr;
@@ -163,7 +171,7 @@ static bool should_hide_mounts_line(const char *line) {
         "magisk","ksu","apatch","lspd","riru","xposed","frida",
         "shamiko","substrate","su_stealth","stealth",
         "/data/adb","/sbin/.magisk","/debug_ramdisk","zygisk",
-        "tmpfs /sbin", nullptr
+        "tmpfs /sbin","overlay","/dev/block/loop", nullptr
     };
     for (size_t i = 0; kP[i]; ++i) if (su_strstr(line, kP[i])) return true;
     return false;
@@ -259,7 +267,42 @@ static void filter_environ(char *buf, size_t len) {
     if (w < len) memset(buf + w, 0, len - w);
 }
 
-/* Decide whether the contents read from `fd` should be filtered. */
+/* ── Cmdline patching: rewrite bootloader/verity boot params ── */
+static void patch_cmdline(char *buf, size_t len) {
+    if (!buf || len == 0) return;
+    /* Replace known boot-state tokens. Space-separated, NUL-terminated. */
+    static const struct { const char *from; const char *to; } repl[] = {
+        {"androidboot.verifiedbootstate=orange", "androidboot.verifiedbootstate=green "},
+        {"androidboot.verifiedbootstate=yellow", "androidboot.verifiedbootstate=green "},
+        {"androidboot.flash.locked=0", "androidboot.flash.locked=1"},
+        {"androidboot.vbmeta.device_state=unlocked", "androidboot.vbmeta.device_state=locked"},
+        {"androidboot.warranty_bit=1", "androidboot.warranty_bit=0"},
+        {nullptr, nullptr}
+    };
+    for (size_t i = 0; i < len; ) {
+        size_t end = i;
+        while (end < len && buf[end] != ' ' && buf[end] != '\0') end++;
+        size_t toklen = end - i;
+        if (toklen > 0) {
+            for (size_t r = 0; repl[r].from; ++r) {
+                size_t flen = strlen(repl[r].from);
+                if (toklen == flen && memcmp(buf + i, repl[r].from, flen) == 0) {
+                    size_t tlen = strlen(repl[r].to);
+                    if (tlen <= toklen) {
+                        memcpy(buf + i, repl[r].to, tlen);
+                        if (tlen < toklen) memset(buf + i + tlen, ' ', toklen - tlen);
+                    }
+                    break;
+                }
+            }
+        }
+        if (end < len) i = end + 1; else break;
+    }
+}
+
+/* Decide whether the contents read from `fd` should be filtered.
+ * Returns: 0=no filtering, 1=filter lines, 2=patch TracerPid,
+ *          3=filter environ, 4=filter cmdline/proc/cmdline */
 static int fd_filter_kind(int fd) {
     char fdpath[64];
     char link[PATH_MAX];
@@ -267,8 +310,11 @@ static int fd_filter_kind(int fd) {
     ssize_t n = real_readlink ? real_readlink(fdpath, link, sizeof(link) - 1) : -1;
     if (n <= 0) return 0;
     link[n] = '\0';
-    if (su_streq(link, "/proc/self/status")) return 2;       /* TracerPid */
-    if (su_streq(link, "/proc/self/environ")) return 3;      /* environ */
+    if (su_streq(link, "/proc/self/status")) return 2;
+    if (su_streq(link, "/proc/self/environ")) return 3;
+    if (su_streq(link, "/proc/self/cmdline")) return 0;
+    if (su_streq(link, "/proc/cmdline")) return 4;
+    if (su_starts(link, "/proc/") && su_strstr(link, "/cmdline")) return 4;
     static const char *const kFilter[] = {
         "/proc/self/maps","/proc/self/mounts","/proc/self/mountinfo",
         "/proc/self/mountstats","/proc/net/unix","/proc/net/tcp",
@@ -420,6 +466,7 @@ static ssize_t my_pread64(int fd, void *buf, size_t count, off64_t offset) {
         if (kind == 1) filter_text_lines((char*)buf, (size_t)n);
         else if (kind == 2) patch_tracerpid((char*)buf, (size_t)n);
         else if (kind == 3) filter_environ((char*)buf, (size_t)n);
+        else if (kind == 4) patch_cmdline((char*)buf, (size_t)n);
     }
     return n;
 }
@@ -432,6 +479,7 @@ static ssize_t my_read(int fd, void *buf, size_t count) {
         if (kind == 1) filter_text_lines((char*)buf, (size_t)n);
         else if (kind == 2) patch_tracerpid((char*)buf, (size_t)n);
         else if (kind == 3) filter_environ((char*)buf, (size_t)n);
+        else if (kind == 4) patch_cmdline((char*)buf, (size_t)n);
     }
     return n;
 }
@@ -576,6 +624,40 @@ static int my_scandir(const char *path, struct dirent ***namelist,
     return real_scandir ? real_scandir(path, namelist, sel, cmp) : -1;
 }
 
+/* statfs/statvfs on hidden paths → ENOENT to hide overlay/magisk mounts */
+static int my_statfs(const char *path, struct statfs *buf) {
+    if (is_hidden_path(path)) { if (buf) memset(buf, 0, sizeof(*buf)); errno = ENOENT; return -1; }
+    return real_statfs ? real_statfs(path, buf) : -1;
+}
+
+static int my_statvfs(const char *path, struct statvfs *buf) {
+    if (is_hidden_path(path)) { if (buf) memset(buf, 0, sizeof(*buf)); errno = ENOENT; return -1; }
+    return real_statvfs ? real_statvfs(path, buf) : -1;
+}
+
+/* getmntent/setmntent: filter mount entries from /proc/mounts */
+static FILE *my_setmntent(const char *path, const char *mode) {
+    return real_setmntent ? real_setmntent(path, mode) : nullptr;
+}
+
+static struct mntent *my_getmntent(FILE *fp) {
+    struct mntent *m;
+    while ((m = real_getmntent ? real_getmntent(fp) : nullptr)) {
+        if (!should_hide_mounts_line(m->mnt_fsname) &&
+            !should_hide_mounts_line(m->mnt_dir) &&
+            !should_hide_mounts_line(m->mnt_type)) {
+            return m;
+        }
+    }
+    return nullptr;
+}
+
+/* Block dlopen of xposed/lsposed/riru/frida libraries */
+static void *my_dlopen(const char *filename, int flags) {
+    if (filename && is_hidden_path(filename)) { errno = ENOENT; return nullptr; }
+    return real_dlopen ? real_dlopen(filename, flags) : nullptr;
+}
+
 /* ── Hook registration ── */
 static void register_hooks_for_object(dev_t dev, ino_t ino) {
     struct { const char *name; void *impl; void **backup; } hooks[] = {
@@ -603,6 +685,13 @@ static void register_hooks_for_object(dev_t dev, ino_t ino) {
         {"opendir",                      (void*)my_opendir,       (void**)&real_opendir},
         {"fdopendir",                    (void*)my_fdopendir,     (void**)&real_fdopendir},
         {"scandir",                      (void*)my_scandir,       (void**)&real_scandir},
+        {"statfs",                       (void*)my_statfs,        (void**)&real_statfs},
+        {"statfs64",                     (void*)my_statfs,        (void**)&real_statfs},
+        {"statvfs",                      (void*)my_statvfs,       (void**)&real_statvfs},
+        {"statvfs64",                    (void*)my_statvfs,       (void**)&real_statvfs},
+        {"setmntent",                    (void*)my_setmntent,     (void**)&real_setmntent},
+        {"getmntent",                    (void*)my_getmntent,     (void**)&real_getmntent},
+        {"dlopen",                       (void*)my_dlopen,         (void**)&real_dlopen},
     };
     for (size_t i = 0; i < sizeof(hooks)/sizeof(hooks[0]); ++i) {
         g_api->pltHookRegister(dev, ino, hooks[i].name, hooks[i].impl, hooks[i].backup);
@@ -649,6 +738,11 @@ static void init_real_symbols(void) {
     real_opendir    = (decltype(real_opendir))dlsym(RTLD_NEXT, "opendir");
     real_fdopendir  = (decltype(real_fdopendir))dlsym(RTLD_NEXT, "fdopendir");
     real_scandir    = (decltype(real_scandir))dlsym(RTLD_NEXT, "scandir");
+    real_statfs     = (decltype(real_statfs))dlsym(RTLD_NEXT, "statfs");
+    real_statvfs    = (decltype(real_statvfs))dlsym(RTLD_NEXT, "statvfs");
+    real_setmntent  = (decltype(real_setmntent))dlsym(RTLD_NEXT, "setmntent");
+    real_getmntent  = (decltype(real_getmntent))dlsym(RTLD_NEXT, "getmntent");
+    real_dlopen     = (decltype(real_dlopen))dlsym(RTLD_NEXT, "dlopen");
 }
 
 static bool process_needs_hidden(int uid, const char *proc) {
