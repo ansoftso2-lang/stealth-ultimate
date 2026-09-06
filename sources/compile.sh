@@ -1,50 +1,69 @@
 #!/usr/bin/env bash
-# Cross-compile the Zygisk library for every Android ABI via ndk-build.
+# Cross-compile the Zygisk library for every Android ABI.
 #
-# This mirrors the upstream zygisk-module-sample build process, which is the
-# only configuration guaranteed to be compatible with the Zygisk loader in
-# zygote: APP_STL=none, -fno-exceptions -fno-rtti, no libc++_shared.so.
+# Direct clang++ invocation with explicit flags. This avoids ndk-build's
+# APP_STL handling complexity and gives full control over linking. We link
+# libc++ statically (-static-libstdc++) so there is NO dependency on
+# libc++_shared.so (absent in zygote), and use -fno-exceptions -fno-rtti to
+# minimize the C++ runtime footprint.
 
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-JNIDIR="$SCRIPT_DIR/zygisk"
+SRC="$SCRIPT_DIR/zygisk/stealth_ultimate.cpp"
 OUT_DIR="$SCRIPT_DIR/zygisk"
 NDK="${NDK_HOME:-${ANDROID_NDK_HOME:-}}"
+API=24
 
-[[ -f "$JNIDIR/stealth_ultimate.cpp" ]] || { echo "Source not found: $JNIDIR/stealth_ultimate.cpp" >&2; exit 1; }
-[[ -f "$JNIDIR/Android.mk" ]]           || { echo "Android.mk not found" >&2; exit 1; }
-[[ -f "$JNIDIR/Application.mk" ]]       || { echo "Application.mk not found" >&2; exit 1; }
-[[ -n "$NDK" && -d "$NDK" ]]            || { echo "Android NDK not found. Set NDK_HOME." >&2; exit 1; }
+INCLUDE_FLAGS=(-I"$SCRIPT_DIR/zygisk")
 
-NDK_BUILD="$(find "$NDK" -maxdepth 1 -name ndk-build -print -quit)"
-[[ -n "$NDK_BUILD" && -x "$NDK_BUILD" ]] || {
-    # On Windows hosts ndk-build is a .cmd/.bat
-    NDK_BUILD="$(find "$NDK" -maxdepth 1 \( -name 'ndk-build.cmd' -o -name 'ndk-build.bat' \) -print -quit)"
-    [[ -n "$NDK_BUILD" ]] || { echo "ndk-build not found in: $NDK" >&2; exit 1; }
+[[ -f "$SRC" ]] || { echo "Source file not found: $SRC" >&2; exit 1; }
+[[ -n "$NDK" && -d "$NDK" ]] || { echo "Android NDK not found. Set NDK_HOME." >&2; exit 1; }
+
+PREBUILT="$(find "$NDK/toolchains/llvm/prebuilt" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+[[ -n "$PREBUILT" && -d "$PREBUILT/bin" ]] || {
+    echo "NDK LLVM toolchain not found under: $NDK" >&2
+    exit 1
 }
 
-BUILD_DIR="$(mktemp -d)"
-trap 'rm -rf "$BUILD_DIR"' EXIT
+COMMON_FLAGS=(
+    -O2
+    -fPIC
+    -shared
+    -std=c++17
+    -fno-exceptions
+    -fno-rtti
+    -Wall
+    -Wextra
+    -fvisibility=hidden
+    -fvisibility-inlines-hidden
+    -static-libstdc++
+    -static-libgcc
+    -Wl,--hash-style=both
+    -Wl,-z,global
+    -Wl,-z,now
+    -Wl,-z,noexecstack
+    -Wl,--exclude-libs,ALL
+)
+LIBS=(-lc -ldl -llog)
 
-echo "Building with: $NDK_BUILD"
-"$NDK_BUILD" \
-    NDK_PROJECT_PATH="$BUILD_DIR" \
-    APP_BUILD_SCRIPT="$JNIDIR/Android.mk" \
-    NDK_APPLICATION_MK="$JNIDIR/Application.mk" \
-    V=1
+compile_arch() {
+    local compiler="$1"
+    local abi="$2"
+    local output="$OUT_DIR/$abi.so"
 
-# ndk-build outputs to <BUILD>/libs/<abi>/libstealth.so
-ABIS=(arm64-v8a armeabi-v7a x86 x86_64)
+    [[ -x "$compiler" ]] || { echo "Compiler not found: $compiler" >&2; exit 1; }
+    echo "Compiling $abi with $(basename "$compiler")..."
+    "$compiler" "${INCLUDE_FLAGS[@]}" "${COMMON_FLAGS[@]}" -o "$output" "$SRC" "${LIBS[@]}"
+    [[ -s "$output" ]] || { echo "Compiler produced no output: $output" >&2; exit 1; }
+    file "$output"
+    ls -lh "$output"
+}
+
 rm -f "$OUT_DIR"/*.so
-for abi in "${ABIS[@]}"; do
-    src="$BUILD_DIR/libs/$abi/libstealth.so"
-    if [[ ! -s "$src" ]]; then
-        echo "Missing or empty build output: $src" >&2
-        exit 1
-    fi
-    cp "$src" "$OUT_DIR/$abi.so"
-    echo "  $abi.so -> $(ls -lh "$OUT_DIR/$abi.so" | awk '{print $5}')"
-done
+compile_arch "$PREBUILT/bin/aarch64-linux-android${API}-clang++" arm64-v8a
+compile_arch "$PREBUILT/bin/armv7a-linux-androideabi${API}-clang++" armeabi-v7a
+compile_arch "$PREBUILT/bin/i686-linux-android${API}-clang++" x86
+compile_arch "$PREBUILT/bin/x86_64-linux-android${API}-clang++" x86_64
 
 echo "All native libraries built successfully."
