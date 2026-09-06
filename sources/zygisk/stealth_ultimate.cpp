@@ -880,9 +880,6 @@ static int phdr_cb(struct dl_phdr_info *info, size_t, void *) {
     if (su_strstr(info->dlpi_name, "su_stealth") ||
         su_strstr(info->dlpi_name, "stealth_ultimate")) return 0;
     struct stat st;
-    /* Use real_stat (dlsym) first; fallback to stat then fstatat.
-     * On arm64 Android 11+, stat() may be inlined to fstatat and not a PLT
-     * symbol, so the direct call can fail. Try multiple methods. */
     int r = -1;
     if (real_stat) r = real_stat(info->dlpi_name, &st);
     if (r != 0) r = stat(info->dlpi_name, &st);
@@ -896,6 +893,46 @@ static int phdr_cb(struct dl_phdr_info *info, size_t, void *) {
     register_hooks_for_object(st.st_dev, st.st_ino);
     g_objects++;
     return 0;
+}
+
+/* Fallback: parse /proc/self/maps to find loaded libraries if dl_iterate_phdr
+ * finds 0 objects (can happen in early zygote before specialize). */
+static void register_hooks_via_maps(void) {
+    int fd = real_openat ? real_openat(AT_FDCWD, "/proc/self/maps", O_RDONLY, 0) : -1;
+    if (fd < 0) return;
+    char buf[8192];
+    char path[PATH_MAX];
+    ssize_t n;
+    /* Simple line parser — extract last field (path) from each line */
+    while ((n = real_read ? real_read(fd, buf, sizeof(buf) - 1) : -1) > 0) {
+        buf[n] = '\0';
+        char *line = buf;
+        char *nl;
+        while ((nl = strchr(line, '\n'))) {
+            *nl = '\0';
+            /* Find the path field — after the last space */
+            char *p = line + strlen(line);
+            while (p > line && *(p-1) != ' ') p--;
+            if (*p == '/') {
+                strncpy(path, p, sizeof(path) - 1);
+                path[sizeof(path) - 1] = '\0';
+                if (!su_strstr(path, "su_stealth") && !su_strstr(path, "stealth_ultimate") &&
+                    !su_strstr(path, "[") && !su_strstr(path, "anon:")) {
+                    struct stat st;
+                    int r = -1;
+                    if (real_stat) r = real_stat(path, &st);
+                    if (r != 0) r = real_fstatat ? real_fstatat(AT_FDCWD, path, &st, 0) : -1;
+                    if (r == 0 && st.st_dev != 0 && st.st_ino != 0) {
+                        register_hooks_for_object(st.st_dev, st.st_ino);
+                        g_objects++;
+                        LOGI("maps: %s dev=%lu ino=%lu", path, (unsigned long)st.st_dev, (unsigned long)st.st_ino);
+                    }
+                }
+            }
+            line = nl + 1;
+        }
+    }
+    close(fd);
 }
 
 static void init_real_symbols(void) {
@@ -1100,9 +1137,19 @@ public:
 
         g_objects = g_registrations = 0;
         dl_iterate_phdr(phdr_cb, nullptr);
+        LOGI("phdr found %d objects", g_objects);
+        /* Fallback: if dl_iterate_phdr found 0 objects, parse /proc/self/maps */
+        if (g_objects == 0) {
+            LOGI("phdr found 0 objects — falling back to /proc/self/maps parsing");
+            register_hooks_via_maps();
+        }
         bool ok = api->pltHookCommit();
         LOGI("install: commit=%d objects=%d regs=%d proc=%s", (int)ok, g_objects, g_registrations, proc);
         if (!ok) LOGE("pltHookCommit FAILED for proc=%s!", proc);
+        /* If still 0 objects, log critical error */
+        if (g_objects == 0) {
+            LOGE("CRITICAL: 0 objects found — hooks will NOT work! proc=%s", proc);
+        }
     }
     void postAppSpecialize(const zygisk::AppSpecializeArgs *) override {}
     /* Do NOT hook system_server — it breaks mount namespace for all forks
