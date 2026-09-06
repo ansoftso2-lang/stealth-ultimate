@@ -32,8 +32,6 @@ COMMON_FLAGS=(
     -std=c++17
     -fno-exceptions
     -fno-rtti
-    -fvisibility=hidden
-    -fvisibility-inlines-hidden
     -Wall
     -Wextra
     -Wl,--hash-style=both
