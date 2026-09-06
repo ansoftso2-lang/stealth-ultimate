@@ -746,16 +746,20 @@ static void init_real_symbols(void) {
 }
 
 static bool process_needs_hidden(int uid, const char *proc) {
+    /* Never hide from real root/system: doing so breaks the OS.
+     * Note: getuid() returns 0 in zygote (pre-specialize), so we cannot use it
+     * as a guard here — only check the target uid and process name. */
     if (uid == 0 || uid == 1000) return false;
-    if (getuid() == 0) return false;
     if (!proc || !*proc) return true;
     static const char *const kExempt[] = {
         "zygote","zygote64","system_server",
         "magisk","magiskd","ksu","ksud","KernelSU","apatch","apd",
         "shamiko","init","adbd","logd","surfaceflinger",
-        "android.system.server", nullptr
+        "android.system.server","com.android.systemui", nullptr
     };
     for (size_t i = 0; kExempt[i]; ++i) if (su_streq(proc, kExempt[i])) return false;
+    /* Exempt systemui sub-processes */
+    if (su_starts(proc, "com.android.systemui:")) return false;
     return true;
 }
 
