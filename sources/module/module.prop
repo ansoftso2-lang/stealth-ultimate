@@ -4,4 +4,4 @@ version=v3.0
 versionCode=300
 author=stealth
 description=Universal Zygisk anti-detection: hides root frameworks (Magisk/KernelSU/APatch), Zygisk, LSPosed/Xposed/Riru, Frida, Shamiko, busybox; spoofs device props, kernel, /proc and SELinux traces. Compatible with Zygisk Next and ReZygisk.
-minMagisk=24000
+minMagisk=26201

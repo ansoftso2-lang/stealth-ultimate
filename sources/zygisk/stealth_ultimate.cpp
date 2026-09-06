@@ -740,4 +740,9 @@ public:
     }
 };
 
+/* No companion IPC needed, but the symbol must be defined and exported so
+ * Zygisk's loader accepts the module as compatible. */
+static void su_companion_handler(int /*client*/) {}
+
 REGISTER_ZYGISK_MODULE(StealthModule)
+REGISTER_ZYGISK_COMPANION(su_companion_handler)

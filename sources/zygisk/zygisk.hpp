@@ -19,7 +19,7 @@
 
 #include <jni.h>
 
-#define ZYGISK_API_VERSION 4
+#define ZYGISK_API_VERSION 5
 
 /*
 
@@ -34,8 +34,8 @@ process to make sure that 3rd party application code is only loaded after it is 
 restricted within a sandbox.
 
 On Android, there is also this special process called "system_server". This single
-process hosts a significant portion of system services, which controls how the
-Android operating system and apps interact with each other.
+process hosts a significant portion of system services, which controls how the Android
+operating system and apps interact with each other.
 
 The Zygisk framework provides a way to allow developers to build modules and run custom
 code before and after system_server and any app processes' specialization.
@@ -109,6 +109,7 @@ public:
     virtual void onLoad([[maybe_unused]] Api *api, [[maybe_unused]] JNIEnv *env) {}
 
     // This method is called before the app process is specialized.
+    //
     // At this point, the process just got forked from zygote, but no app specific specialization
     // is applied. This means that the process does not have any sandbox restrictions and
     // still runs with the same privilege of zygote.
@@ -123,15 +124,18 @@ public:
     virtual void preAppSpecialize([[maybe_unused]] AppSpecializeArgs *args) {}
 
     // This method is called after the app process is specialized.
+    //
     // At this point, the process has all sandbox restrictions enabled for this application.
     // This means that this method runs with the same privilege of the app's own code.
     virtual void postAppSpecialize([[maybe_unused]] const AppSpecializeArgs *args) {}
 
     // This method is called before the system server process is specialized.
+    //
     // See preAppSpecialize(args) for more info.
     virtual void preServerSpecialize([[maybe_unused]] ServerSpecializeArgs *args) {}
 
     // This method is called after the system server process is specialized.
+    //
     // At this point, the process runs with the privilege of system_server.
     virtual void postServerSpecialize([[maybe_unused]] const ServerSpecializeArgs *args) {}
 };
@@ -190,6 +194,7 @@ enum Option : int {
     FORCE_DENYLIST_UNMOUNT = 0,
 
     // When this option is set, your module's library will be dlclose-ed after post[XXX]Specialize.
+    //
     // Be aware that after dlclose-ing your module, all of your code will be unmapped from memory.
     // YOU MUST NOT ENABLE THIS OPTION AFTER HOOKING ANY FUNCTIONS IN THE PROCESS.
     DLCLOSE_MODULE_LIBRARY = 1,
