@@ -745,6 +745,57 @@ static void init_real_symbols(void) {
     real_dlopen     = (decltype(real_dlopen))dlsym(RTLD_NEXT, "dlopen");
 }
 
+/* ── JNI SystemProperties hooks ──
+ * These intercept Java-level property reads. The original function pointer
+ * is stored in the JNINativeMethod.fnPtr by hookJniNativeMethods. */
+static jstring (*orig_sysprop_get)(JNIEnv *, jclass, jstring);
+
+static jstring su_jni_prop_get(JNIEnv *e, jclass clazz, jstring key) {
+    if (!e || !key) return orig_sysprop_get ? orig_sysprop_get(e, clazz, key) : nullptr;
+    const char *k = e->GetStringUTFChars(key, nullptr);
+    if (!k) return orig_sysprop_get ? orig_sysprop_get(e, clazz, key) : nullptr;
+    const char *v = spoof_value_for(k);
+    e->ReleaseStringUTFChars(key, k);
+    if (v) {
+        /* For hidden (empty) properties, return empty string */
+        return e->NewStringUTF(v);
+    }
+    return orig_sysprop_get ? orig_sysprop_get(e, clazz, key) : e->NewStringUTF("");
+}
+
+static jboolean su_jni_prop_get_boolean(JNIEnv *e, jclass clazz, jstring key, jboolean def) {
+    if (!e || !key) return def;
+    const char *k = e->GetStringUTFChars(key, nullptr);
+    if (!k) return def;
+    const char *v = spoof_value_for(k);
+    e->ReleaseStringUTFChars(key, k);
+    if (v) {
+        if (*v == '1' || *v == 't' || *v == 'T') return JNI_TRUE;
+        return JNI_FALSE;
+    }
+    return orig_sysprop_get ? (jboolean)0 : def;
+}
+
+static jint su_jni_prop_get_int(JNIEnv *e, jclass clazz, jstring key, jint def) {
+    if (!e || !key) return def;
+    const char *k = e->GetStringUTFChars(key, nullptr);
+    if (!k) return def;
+    const char *v = spoof_value_for(k);
+    e->ReleaseStringUTFChars(key, k);
+    if (v && *v) return (jint)atoi(v);
+    return def;
+}
+
+static jlong su_jni_prop_get_long(JNIEnv *e, jclass clazz, jstring key, jlong def) {
+    if (!e || !key) return def;
+    const char *k = e->GetStringUTFChars(key, nullptr);
+    if (!k) return def;
+    const char *v = spoof_value_for(k);
+    e->ReleaseStringUTFChars(key, k);
+    if (v && *v) return (jlong)atoll(v);
+    return def;
+}
+
 static bool process_needs_hidden(int uid, const char *proc) {
     /* Never hide from real root/system: doing so breaks the OS.
      * Note: getuid() returns 0 in zygote (pre-specialize), so we cannot use it
@@ -811,6 +862,20 @@ public:
         }
         g_hidden = true;
         api->setOption(zygisk::Option::FORCE_DENYLIST_UNMOUNT);
+
+        /* JNI hook: intercept android.os.SystemProperties native methods so
+         * Java-level property reads also get spoofed values. Native Detector
+         * and many apps use SystemProperties.get() from Java. */
+        JNINativeMethod propMethods[] = {
+            {(char*)"get",      (char*)"(Ljava/lang/String;)Ljava/lang/String;", (void*)su_jni_prop_get},
+            {(char*)"getBoolean",(char*)"(Ljava/lang/String;Z)Z",               (void*)su_jni_prop_get_boolean},
+            {(char*)"getInt",   (char*)"(Ljava/lang/String;I)I",                 (void*)su_jni_prop_get_int},
+            {(char*)"getLong",  (char*)"(Ljava/lang/String;J)J",                 (void*)su_jni_prop_get_long},
+        };
+        api->hookJniNativeMethods(env, "android/os/SystemProperties",
+                                  propMethods, sizeof(propMethods)/sizeof(propMethods[0]));
+        LOGI("JNI SystemProperties hooks installed");
+
         g_objects = g_registrations = 0;
         dl_iterate_phdr(phdr_cb, nullptr);
         bool ok = api->pltHookCommit();
