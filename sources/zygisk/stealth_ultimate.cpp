@@ -37,7 +37,7 @@
 
 #include "zygisk.hpp"
 
-#define SU_ENABLE_LOG 1
+#define SU_ENABLE_LOG 0
 #if SU_ENABLE_LOG
 #include <android/log.h>
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  "su_mod", __VA_ARGS__)
@@ -109,7 +109,16 @@ static inline bool su_starts(const char *s, const char *p) { return s && p && st
 
 /* ── Path classification ── */
 static bool is_hidden_path(const char *path) {
-    if (!path || !*path) return false;
+    if (!path || !*path || !g_hidden) return false;
+    /* Fast reject: only check paths that could be root-related */
+    char c0 = path[0];
+    /* Quick check: if path doesn't contain /data, /sbin, /system, /cache, /proc
+     * or known keywords, skip the expensive strstr loop */
+    if (c0 != '/' && c0 != 'm' && c0 != 'k' && c0 != 'a' && c0 != 'x' &&
+        c0 != 'l' && c0 != 'r' && c0 != 'f' && c0 != 's' && c0 != 'b' &&
+        c0 != 'S' && c0 != 'n' && c0 != 'c' && c0 != 'd' && c0 != 'e' &&
+        c0 != 'z' && c0 != 'i')
+        return false;
     if (su_strstr(path, "/data/local/tmp/")) {
         static const char *const kTmp[] = {
             "/magisk","/frida","/re.frida","/gum","/linjector","/busybox",
@@ -580,11 +589,26 @@ static int create_filtered_memfd(const char *path) {
 
 /* ── Hook functions ── */
 
+/* Fast check: is this a path we should intercept for memfd? */
+static inline bool is_proc_filterable(const char *path) {
+    if (!path || !g_hidden) return false;
+    /* Quick reject: only /proc paths */
+    if (path[0] != '/' || path[1] != 'p' || path[2] != 'r' || path[3] != 'o' || path[4] != 'c')
+        return false;
+    return su_streq(path, "/proc/self/maps") || su_streq(path, "/proc/self/smaps") ||
+           su_streq(path, "/proc/self/mountinfo") || su_streq(path, "/proc/self/mounts") ||
+           su_streq(path, "/proc/self/mountstats") || su_streq(path, "/proc/self/environ") ||
+           su_streq(path, "/proc/self/status") || su_streq(path, "/proc/cmdline") ||
+           (su_starts(path, "/proc/") && (su_strstr(path, "/maps") || su_strstr(path, "/mounts") ||
+            su_strstr(path, "/environ") || su_strstr(path, "/status") || su_strstr(path, "/cmdline")));
+}
+
 static int my_openat(int fd, const char *path, int flags, ...) {
     if (is_hidden_path(path)) { errno = ENOENT; return -1; }
-    /* Try memfd substitution for proc files */
-    int memfd = create_filtered_memfd(path);
-    if (memfd >= 0) return memfd;
+    if (is_proc_filterable(path)) {
+        int memfd = create_filtered_memfd(path);
+        if (memfd >= 0) return memfd;
+    }
     mode_t mode = 0;
     if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = (int)va_arg(ap, int); va_end(ap); }
     return real_openat ? real_openat(fd, path, flags, mode) : -1;
@@ -592,8 +616,10 @@ static int my_openat(int fd, const char *path, int flags, ...) {
 
 static int my_open(const char *path, int flags, ...) {
     if (is_hidden_path(path)) { errno = ENOENT; return -1; }
-    int memfd = create_filtered_memfd(path);
-    if (memfd >= 0) return memfd;
+    if (is_proc_filterable(path)) {
+        int memfd = create_filtered_memfd(path);
+        if (memfd >= 0) return memfd;
+    }
     mode_t mode = 0;
     if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = (int)va_arg(ap, int); va_end(ap); }
     return real_open ? real_open(path, flags, mode) : -1;
@@ -649,7 +675,10 @@ static struct dirent *my_readdir(DIR *dirp) {
 }
 
 static ssize_t my_pread64(int fd, void *buf, size_t count, off64_t offset) {
-    if (!buf || count == 0) return 0;
+    if (!buf || count == 0 || !g_hidden) {
+        if (!buf || count == 0) return 0;
+        return real_pread64 ? real_pread64(fd, buf, count, offset) : -1;
+    }
     ssize_t n = real_pread64 ? real_pread64(fd, buf, count, offset)
               : (offset == 0 && real_read ? real_read(fd, buf, count) : -1);
     if (n > 0) {
@@ -665,7 +694,7 @@ static ssize_t my_pread64(int fd, void *buf, size_t count, off64_t offset) {
 static ssize_t my_read(int fd, void *buf, size_t count) {
     if (!buf || count == 0) return 0;
     ssize_t n = real_read ? real_read(fd, buf, count) : -1;
-    if (n > 0) {
+    if (n > 0 && g_hidden) {
         int kind = fd_filter_kind(fd);
         if (kind == 1) filter_text_lines((char*)buf, (size_t)n);
         else if (kind == 2) patch_tracerpid((char*)buf, (size_t)n);
@@ -796,16 +825,13 @@ static void my_prop_read_callback(const prop_info *pi,
 /* ── fopen/opendir/scandir hooks ── */
 static FILE *my_fopen(const char *path, const char *mode) {
     if (is_hidden_path(path)) { errno = ENOENT; return nullptr; }
-    /* Try memfd substitution for proc files */
-    int memfd = create_filtered_memfd(path);
-    if (memfd >= 0) {
-        /* Wrap memfd in FILE* via fdopen */
-        if (real_fopen) {
-            /* fdopen is in libc, use it to wrap our memfd */
+    if (is_proc_filterable(path)) {
+        int memfd = create_filtered_memfd(path);
+        if (memfd >= 0) {
             FILE *fp = fdopen(memfd, mode);
             if (fp) return fp;
+            close(memfd);
         }
-        close(memfd);
     }
     return real_fopen ? real_fopen(path, mode) : nullptr;
 }

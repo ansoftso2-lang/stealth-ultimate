@@ -1,6 +1,6 @@
 #!/system/bin/sh
-# post-fs-data.sh v7.0 — Maximum hiding: global prop spoofing + SELinux patches
-# + keymaster access + vbmeta hiding + boot state spoofing
+# post-fs-data.sh v7.1 — Maximum hiding with bootloop protection
+# All operations are best-effort: if any fails, boot continues normally.
 MODDIR=${0%/*}
 DATA_DIR="/data/adb/su_stealth"
 
@@ -10,9 +10,18 @@ mkdir -p "$DATA_DIR" 2>/dev/null
 chmod 644 "$DATA_DIR/spoof.conf" 2>/dev/null
 
 LOG="$DATA_DIR/stealth_boot.log"
-log() { echo "$(date '+%H:%M:%S') [boot] $1" >> "$LOG" 2>/dev/null || true; }
+log() { echo "$(date '+%H:%M:%S') [boot] $1" >> "$LOG" 2>/dev/null; }
 
 log "=== post-fs-data.sh starting ==="
+
+# ── Bootloop protection: limit log size ──
+if [ -f "$LOG" ]; then
+    LOGSIZE=$(stat -c%s "$LOG" 2>/dev/null || echo 0)
+    if [ "$LOGSIZE" -gt 102400 ]; then
+        : > "$LOG"
+        log "=== log rotated ==="
+    fi
+fi
 
 # ── 1. SELinux enforce ──
 ENF=/sys/fs/selinux/enforce
@@ -28,19 +37,16 @@ MAGISKPOLICY="/data/adb/magisk/magiskpolicy"
 [ -x "$MAGISKPOLICY" ] || MAGISKPOLICY=$(which magiskpolicy 2>/dev/null)
 
 if [ -x "$MAGISKPOLICY" ]; then
-    # Allow keymaster HAL access
-    $MAGISKPOLICY --live "allow * hal_keymaster_default:binder call" 2>/dev/null
-    $MAGISKPOLICY --live "allow * hal_keymaster_default:binder transfer" 2>/dev/null
-    $MAGISKPOLICY --live "allow * hal_keymaster_default:fd use" 2>/dev/null
-    # Allow keystore access
-    $MAGISKPOLICY --live "allow * keystore_service:binder call" 2>/dev/null
-    $MAGISKPOLICY --live "allow * keystore_service:fd use" 2>/dev/null
-    # Allow root to access keymaster proc
-    $MAGISKPOLICY --live "allow root proc_keymaster:file rw" 2>/dev/null
-    $MAGISKPOLICY --live "allow root proc_keymaster:dir search" 2>/dev/null
-    # Allow access to verified boot props
-    $MAGISKPOLICY --live "allow root proc_bootconfig:file r" 2>/dev/null
-    $MAGISKPOLICY --live "allow root proc_cmdline:file r" 2>/dev/null
+    # Allow keymaster HAL access (with 5s timeout to prevent boot hang)
+    timeout 5 $MAGISKPOLICY --live "allow * hal_keymaster_default:binder call" 2>/dev/null
+    timeout 5 $MAGISKPOLICY --live "allow * hal_keymaster_default:binder transfer" 2>/dev/null
+    timeout 5 $MAGISKPOLICY --live "allow * hal_keymaster_default:fd use" 2>/dev/null
+    timeout 5 $MAGISKPOLICY --live "allow * keystore_service:binder call" 2>/dev/null
+    timeout 5 $MAGISKPOLICY --live "allow * keystore_service:fd use" 2>/dev/null
+    timeout 5 $MAGISKPOLICY --live "allow root proc_keymaster:file rw" 2>/dev/null
+    timeout 5 $MAGISKPOLICY --live "allow root proc_keymaster:dir search" 2>/dev/null
+    timeout 5 $MAGISKPOLICY --live "allow root proc_bootconfig:file r" 2>/dev/null
+    timeout 5 $MAGISKPOLICY --live "allow root proc_cmdline:file r" 2>/dev/null
     log "SELinux policy patched for keymaster + verified boot"
 else
     log "WARNING: magiskpolicy not found — SELinux patches skipped"
