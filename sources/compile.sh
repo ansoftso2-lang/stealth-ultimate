@@ -47,6 +47,7 @@ COMMON_CXXFLAGS=(
     -std=c++17
     -fno-exceptions
     -fno-rtti
+    -nostdlib++
     -Wall
     -Wextra
 )
