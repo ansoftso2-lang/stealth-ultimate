@@ -27,15 +27,16 @@ PREBUILT="$(find "$NDK/toolchains/llvm/prebuilt" -mindepth 1 -maxdepth 1 -type d
 }
 SYSROOT="$PREBUILT/sysroot"
 
-# Locate libc++_static.a for each target triple.
+# Locate libc++_static.a for the given target triple. Must match the ABI
+# exactly or the linker rejects it as incompatible.
 libcxx_static_for() {
     local triple="$1"
-    local f
-    # NDK r27 layout: sources/cxx-stl/llvm-libc++/libs/<abi>/libc++_static.a
-    f="$(find "$NDK/sources/cxx-stl/llvm-libc++" -path "*/libs/*/libc++_static.a" 2>/dev/null | head -1)"
-    # Fallback: toolchain libs
-    [[ -n "$f" ]] || f="$(find "$PREBUILT" -name libc++_static.a -path "*${triple}*" 2>/dev/null | head -1)"
-    [[ -n "$f" ]] || f="$(find "$PREBUILT" -name libc++_static.a 2>/dev/null | head -1)"
+    local f="$SYSROOT/usr/lib/$triple/libc++_static.a"
+    [[ -f "$f" ]] || f="$SYSROOT/usr/lib/$triple/libc++_static.a"
+    [[ -f "$f" ]] || {
+        # NDK fallback layout
+        f="$(find "$NDK/sources/cxx-stl/llvm-libc++/libs" -path "*$triple*" -name libc++_static.a 2>/dev/null | head -1)"
+    }
     echo "$f"
 }
 
@@ -90,8 +91,10 @@ compile_arch() {
 }
 
 rm -f "$OUT_DIR"/*.so
+# triples used here are the sysroot usr/lib/ directory names, which differ
+# from the clang target triples for armv7 (arm-linux-androideabi vs armv7a-...).
 compile_arch "$PREBUILT/bin/aarch64-linux-android${API}-clang++"  arm64-v8a    aarch64-linux-android
-compile_arch "$PREBUILT/bin/armv7a-linux-androideabi${API}-clang++" armeabi-v7a armv7a-linux-androideabi
+compile_arch "$PREBUILT/bin/armv7a-linux-androideabi${API}-clang++" armeabi-v7a arm-linux-androideabi
 compile_arch "$PREBUILT/bin/i686-linux-android${API}-clang++"      x86          i686-linux-android
 compile_arch "$PREBUILT/bin/x86_64-linux-android${API}-clang++"    x86_64       x86_64-linux-android
 
