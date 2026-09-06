@@ -1076,13 +1076,9 @@ public:
         if (!ok) LOGE("pltHookCommit FAILED for proc=%s!", proc);
     }
     void postAppSpecialize(const zygisk::AppSpecializeArgs *) override {}
-    void preServerSpecialize(zygisk::ServerSpecializeArgs *) override {
-        g_hidden = true;
-        api->setOption(zygisk::Option::FORCE_DENYLIST_UNMOUNT);
-        g_objects = g_registrations = 0;
-        dl_iterate_phdr(phdr_cb, nullptr);
-        api->pltHookCommit();
-    }
+    /* Do NOT hook system_server — it breaks mount namespace for all forks
+     * and causes root access issues in child processes. */
+    void preServerSpecialize(zygisk::ServerSpecializeArgs *) override {}
     void postServerSpecialize(const zygisk::ServerSpecializeArgs *) override {}
 };
 
