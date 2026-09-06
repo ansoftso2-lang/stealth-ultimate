@@ -746,3 +746,20 @@ static void su_companion_handler(int /*client*/) {}
 
 REGISTER_ZYGISK_MODULE(StealthModule)
 REGISTER_ZYGISK_COMPANION(su_companion_handler)
+
+/* ── C++ runtime stubs ──
+ * APP_STL=none means no libc++ is linked. The compiler still emits calls to
+ * __cxa_atexit / __cxa_finalize (static destructors) and __cxa_guard_*
+ * (thread-safe static local init). bionic libc.so provides these on all
+ * modern Android, but to be fully self-contained and avoid any dlopen
+ * resolution issues in zygote, we provide trivial no-op implementations.
+ * Our code never throws, never relies on static destruction, and all guarded
+ * statics are initialized with constant values, so these stubs are safe. */
+extern "C" {
+int __cxa_atexit(void (*)(void *), void *, void *) { return 0; }
+void __cxa_finalize(void *) {}
+/* __cxa_guard_acquire: return 0 = already initialized, no call needed */
+unsigned __cxa_guard_acquire(unsigned *g) { (void)g; return 0; }
+void __cxa_guard_release(unsigned *g) { (void)g; }
+void __cxa_guard_abort(unsigned *g) { (void)g; }
+}
