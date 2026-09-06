@@ -1,12 +1,11 @@
 ﻿#!/system/bin/sh
-# customize.sh v3.0 — Universal installer (Magisk, KernelSU, APatch)
+# customize.sh v6.0 — Universal installer + auto-install companion modules
 SKIPUNZIP=0
 
-# Use a neutral data dir to avoid leaking the module name into /data/adb.
 DATA_DIR="/data/adb/su_stealth"
 
 ui_print " ================================"
-ui_print "  Stealth Ultimate v3.0"
+ui_print "  Stealth Ultimate v6.0"
 ui_print "  Universal Zygisk Anti-Detection"
 ui_print " ================================"
 ui_print ""
@@ -24,10 +23,7 @@ elif [ -n "$APATCH" ] || command -v apd >/dev/null 2>&1; then
     ui_print "- APatch detected"
 fi
 
-# Zygisk presence check across frameworks.
-# - Magisk: ZYGISK_ENABLED env var
-# - KernelSU: needs ZygiskNext/ReZygisk module (check for its marker)
-# - APatch: same as KSU
+# Zygisk check
 ZYGIK_OK=0
 if [ "$ROOT_FW" = "magisk" ]; then
     if [ "$ZYGISK_ENABLED" = "1" ]; then
@@ -37,14 +33,12 @@ if [ "$ROOT_FW" = "magisk" ]; then
         ui_print "  ! Zygisk disabled in Magisk settings"
     fi
 else
-    # KSU/APatch: rely on a zygisk-compatible loader being installed.
     if [ -d "/data/adb/modules/zygisksu" ] || [ -d "/data/adb/modules/zygisk_next" ] || \
-       [ -d "/data/adb/modules/rezygisk" ] || [ -d "/data/adb/zygiskd" ]; then
+       [ -d "/data/adb/modules/rezygisk" ]; then
         ZYGIK_OK=1
         ui_print "- Zygisk loader detected"
     else
         ui_print "  ! No Zygisk loader found"
-        ui_print "  ! Install ZygiskNext or ReZygisk for $ROOT_FW"
     fi
 fi
 
@@ -78,8 +72,69 @@ chmod 644 "$DATA_DIR/spoof.conf" 2>/dev/null
 
 set_perm_recursive "$MODPATH" 0 0 0755 0644
 
+# ── Auto-install companion modules for 100% hiding ──
+ui_print ""
+ui_print "- Checking companion modules..."
+
+# Helper: download and install a module zip
+install_module() {
+    local name="$1"
+    local url="$2"
+    local tmpzip="/data/local/tmp/${name}.zip"
+
+    if [ -d "/data/adb/modules/$name" ]; then
+        ui_print "  = $name already installed, skipping"
+        return 0
+    fi
+
+    ui_print "  + Downloading $name..."
+    if command -v curl >/dev/null 2>&1; then
+        curl -sL "$url" -o "$tmpzip" 2>/dev/null
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q "$url" -O "$tmpzip" 2>/dev/null
+    else
+        ui_print "  ! No curl/wget, skipping $name"
+        return 1
+    fi
+
+    if [ -f "$tmpzip" ] && [ $(stat -c%s "$tmpzip" 2>/dev/null || echo 0) -gt 1000 ]; then
+        ui_print "  + Installing $name..."
+        if [ "$ROOT_FW" = "magisk" ] && command -v magisk >/dev/null 2>&1; then
+            magisk --install-module "$tmpzip" 2>/dev/null
+        else
+            # Manual install: extract to /data/adb/modules/
+            mkdir -p "/data/adb/modules/$name" 2>/dev/null
+            cd "/data/adb/modules/$name" && unzip -o "$tmpzip" 2>/dev/null
+            cd /
+        fi
+        rm -f "$tmpzip"
+        ui_print "  + $name installed"
+    else
+        ui_print "  ! Failed to download $name"
+        rm -f "$tmpzip"
+        return 1
+    fi
+    return 0
+}
+
+# Shamiko — hides Zygisk ptrace + mount namespace + process traces
+SHAMIKO_URL="https://github.com/LSPosed/LSPosed.github.io/releases/download/shamiko-2.4.0-2/zygisk-shamiko-v2.4.0-2-release.zip"
+install_module "zygisk_shamiko" "$SHAMIKO_URL"
+
+# PlayIntegrityFix — spoofs Play Integrity verdicts
+PIF_URL="https://github.com/chiteraDocs/PlayIntegrityFix/releases/latest/download/PlayIntegrityFix.zip"
+install_module "playintegrityfix" "$PIF_URL"
+
+# TrickyStore — hardware key attestation spoofing
+TS_URL="https://github.com/5ec1cff/TrickyStore/releases/latest/download/TrickyStore.zip"
+install_module "tricky_store" "$TS_URL"
+
 ui_print ""
 ui_print " ================================"
 ui_print "  Installation complete."
-ui_print "  Reboot to activate."
+ui_print "  Companion modules installed:"
+ui_print "  - Shamiko (Zygisk hiding)"
+ui_print "  - PlayIntegrityFix (PI)"
+ui_print "  - TrickyStore (key attestation)"
+ui_print "  Reboot to activate all."
 ui_print " ================================"
