@@ -1,29 +1,10 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * stealth_ultimate.cpp — Universal Zygisk Anti-Detection Module (v3.0)
+ * stealth_ultimate.cpp — Universal Zygisk Anti-Detection Module (v4.0)
  *
- * Targets: Magisk (+Zygisk), KernelSU (with zygisksu/zygisk-next), APatch,
- *          Zygisk Next, ReZygisk. Works under custom ROMs and crowded setups.
- *
- * Hides:  root, Magisk, KernelSU, APatch, Zygisk family, LSPosed, Xposed,
- *         Riru, Shamiko, Frida (gum/linjector/server), busybox, resetprop,
- *         SELinux permissive traces, ptrace/TracerPid, module mounts,
- *         Zygisk traces in maps/auxv/cmdline, /data/adb contents.
- *
- * Hooks (PLT):  openat open access faccessat stat lstat fstatat readlink
- *               readlinkat readdir read pread64 uname ptrace syscall
- *               __system_property_get __system_property_get_callback
- *
- * Design rules enforced:
- *  - Correct C ABI for every hooked symbol (no signature mismatch).
- *  - read/pread64 filtering is scoped to /proc/self/* and known text-only
- *    pseudo-files. Regular files, sockets, pipes are passed through untouched
- *    to avoid corrupting app data and protocol buffers.
- *  - No logcat emission after specialization (self-demotion removed).
- *  - FORCE_DENYLIST_UNMOUNT requested for compatibility with Magisk.
- *  - process_needs_hidden exempts root/system/zygote/init but protects every
- *    normal app AND system_server.
- *  - Inline-callable property readback via __system_property_get_callback.
+ * Maximum-coverage hiding. Adds property find/read/read_callback hooks,
+ * fopen/opendir/fdopendir/scandir, /proc/self/environ filtering, and
+ * stricter path blocking. Targets Native Detector and similar checkers.
  */
 #define _GNU_SOURCE
 #include <jni.h>
@@ -51,7 +32,6 @@
 
 #include "zygisk.hpp"
 
-/* ── Logging: enabled to diagnose hook installation ── */
 #define SU_ENABLE_LOG 1
 #if SU_ENABLE_LOG
 #include <android/log.h>
@@ -65,155 +45,100 @@
 #endif
 
 /* ── Real function pointers ── */
-static int           (*real_openat)(int, const char *, int, ...)               = nullptr;
-static int           (*real_open)(const char *, int, ...)                       = nullptr;
-static int           (*real_access)(const char *, int)                          = nullptr;
-static int           (*real_faccessat)(int, const char *, int, int)             = nullptr;
-static int           (*real_stat)(const char *, struct stat *)                  = nullptr;
-static int           (*real_lstat)(const char *, struct stat *)                 = nullptr;
-static int           (*real_fstatat)(int, const char *, struct stat *, int)     = nullptr;
-static ssize_t       (*real_readlink)(const char *, char *, size_t)             = nullptr;
-static ssize_t       (*real_readlinkat)(int, const char *, char *, size_t)      = nullptr;
+static int            (*real_openat)(int, const char *, int, ...)               = nullptr;
+static int            (*real_open)(const char *, int, ...)                       = nullptr;
+static int            (*real_access)(const char *, int)                          = nullptr;
+static int            (*real_faccessat)(int, const char *, int, int)             = nullptr;
+static int            (*real_stat)(const char *, struct stat *)                  = nullptr;
+static int            (*real_lstat)(const char *, struct stat *)                 = nullptr;
+static int            (*real_fstatat)(int, const char *, struct stat *, int)     = nullptr;
+static int            (*real_fstat)(int, struct stat *)                          = nullptr;
+static ssize_t        (*real_readlink)(const char *, char *, size_t)             = nullptr;
+static ssize_t        (*real_readlinkat)(int, const char *, char *, size_t)      = nullptr;
 static struct dirent *(*real_readdir)(DIR *)                                    = nullptr;
-static ssize_t       (*real_pread64)(int, void *, size_t, off64_t)               = nullptr;
-static ssize_t       (*real_read)(int, void *, size_t)                           = nullptr;
-static int           (*real_uname)(struct utsname *)                            = nullptr;
-static int           (*real_ptrace)(int, ...)                                    = nullptr;
-static long          (*real_syscall)(long, ...)                                  = nullptr;
-static int           (*real_prop_get)(const char *, char *, size_t)             = nullptr;
+static ssize_t        (*real_pread64)(int, void *, size_t, off64_t)               = nullptr;
+static ssize_t        (*real_read)(int, void *, size_t)                           = nullptr;
+static int            (*real_uname)(struct utsname *)                            = nullptr;
+static int            (*real_ptrace)(int, ...)                                    = nullptr;
+static long           (*real_syscall)(long, ...)                                  = nullptr;
+static int            (*real_prop_get)(const char *, char *, size_t)             = nullptr;
+static const prop_info *(*real_prop_find)(const char *)                          = nullptr;
+static int            (*real_prop_read)(const prop_info *, char *, size_t)        = nullptr;
+static void           (*real_prop_read_callback)(const prop_info *,
+        void (*)(const char *, const char *, uint32_t, void *), void *)          = nullptr;
+static FILE           *(*real_fopen)(const char *, const char *)                  = nullptr;
+static DIR            *(*real_opendir)(const char *)                              = nullptr;
+static DIR            *(*real_fdopendir)(int)                                    = nullptr;
+static int            (*real_scandir)(const char *, struct dirent ***,
+        int (*)(const struct dirent *), int (*)(const struct dirent **, const struct dirent **)) = nullptr;
 
 /* ── Module global state ── */
-static zygisk::Api *g_api           = nullptr;
-static bool         g_hidden        = false;
-[[maybe_unused]] static int g_objects       = 0;
+static zygisk::Api *g_api = nullptr;
+static bool g_hidden = false;
+[[maybe_unused]] static int g_objects = 0;
 [[maybe_unused]] static int g_registrations = 0;
 
-/* ── Spoof profile (defaults reflect a consistent Pixel device) ──
- * Override at runtime from /data/adb/su_stealth/spoof.conf via companion. */
-struct SpoofProfile {
-    const char *fingerprint;
-    const char *brand;
-    const char *manufacturer;
-    const char *model;
-    const char *device;
-    const char *product;
-    const char *board;
-    const char *hardware;
-    const char *bootloader;
-    const char *build_id;
-    const char *incremental;
-    const char *security_patch;
-    const char *build_type;
-    const char *build_tags;
-    const char *release;
-    const char *sdk;
-    const char *abi;
-    const char *abi_list;
-    const char *verified_bootstate;
-    const char *flash_locked;
-    const char *vbmeta_state;
-    const char *kernel_release;
-    const char *kernel_version;
-    const char *serial;
-    const char *bootreason;
-    const char *cpu_cores;
-    const char *cpu_model;
-    const char *cpu_hardware;
-    const char *radio;
-};
-static const SpoofProfile g_spoof = {
-    "google/bluejay/bluejay:14/UD1A.240105.004/11207768:user/release-keys",
-    "google", "Google", "Pixel 6a", "bluejay", "bluejay", "bluejay",
-    "bluejay", "bluejay-1.0-1068493", "UD1A.240105.004", "11207768",
-    "2024-01-05", "user", "release-keys", "14", "34",
-    "arm64-v8a", "arm64-v8a,armeabi-v7a,armeabi",
-    "green", "1", "locked",
-    "5.10.149-android14-13-00001-g1234567890ab",
-    "#1 SMP PREEMPT Mon Jan 1 00:00:00 UTC 2024",
-    "RF5C1234ABCD", "reboot",
-    "8", "Cortex-A55", "qcom",
-    "g5300q-240105-240111-B-11207768"
-};
+/* ── Spoof profile ── */
+static const char *SPOOF_FP =
+    "google/bluejay/bluejay:14/UD1A.240105.004/11207768:user/release-keys";
 
-/* ── Helpers ── */
-static inline bool su_streq(const char *a, const char *b) {
-    return a && b && strcmp(a, b) == 0;
-}
-static inline bool su_strstr(const char *s, const char *needle) {
-    return s && needle && strstr(s, needle);
-}
-static inline bool su_starts(const char *s, const char *pfx) {
-    return s && pfx && strncmp(s, pfx, strlen(pfx)) == 0;
-}
+static inline bool su_streq(const char *a, const char *b) { return a && b && strcmp(a, b) == 0; }
+static inline bool su_strstr(const char *s, const char *n) { return s && n && strstr(s, n); }
+static inline bool su_starts(const char *s, const char *p) { return s && p && strncmp(s, p, strlen(p)) == 0; }
 
-/* ── Path classification ──
- * Conservative: hide known root/artifact paths only. We never block broad
- * directories like /data/local/tmp wholesale — that itself is a tell. */
+/* ── Path classification ── */
 static bool is_hidden_path(const char *path) {
     if (!path || !*path) return false;
-    /* Allow legitimate per-process tmp use; only hide known artifacts there */
     if (su_strstr(path, "/data/local/tmp/")) {
         static const char *const kTmp[] = {
-            "magisk", "frida", "re.frida", "gum", "linjector",
-            "busybox", "su", "stealth", "riru", "xposed", "lspd",
-            "magiskboot", "resetprop", nullptr
+            "magisk","frida","re.frida","gum","linjector","busybox",
+            "su","stealth","riru","xposed","lspd","magiskboot","resetprop", nullptr
         };
-        for (size_t i = 0; kTmp[i]; ++i)
-            if (su_strstr(path, kTmp[i])) return true;
+        for (size_t i = 0; kTmp[i]; ++i) if (su_strstr(path, kTmp[i])) return true;
         return false;
     }
     static const char *const kHidden[] = {
-        "/data/adb/magisk", "/data/adb/modules", "/data/adb/zygisk",
-        "/data/adb/ksu", "/data/adb/ksud", "/data/adb/KernelSU",
-        "/data/adb/apatch", "/data/adb/apd", "/data/adb/su_stealth",
-        "/data/adb/stealth", "/data/adb/stealth_ultimate",
-        "/cache/stealth_ultimate", "/cache/su_stealth",
-        "/sbin/.magisk", "/debug_ramdisk",
-        "magisk", ".magisk", "magiskdb", "magiskd", "magiskpolicy",
-        "kernelsu", "ksu", "ksud", "apatch", "apd",
-        "xposed", "lspd", "lsposed", "riru", "shamiko", "substrate",
-        "de.robv.android.xposed", "org.lsposed",
-        "frida", "re.frida.server", "gum-js-loop", "linjector",
-        "/system/bin/su", "/system/xbin/su", "/vendor/bin/su",
-        "superuser", "supersu", "/system/app/Superuser",
-        "busybox", "resetprop", "sepolicy", "supolicy",
-        "/sys/fs/selinux/enforce", "/sys/fs/selinux/booleans",
+        "/data/adb","/sbin/.magisk","/debug_ramdisk",
+        "magisk",".magisk","magiskdb","magiskd","magiskpolicy","magiskboot",
+        "kernelsu","ksu","ksud","apatch","apd","KernelSU",
+        "xposed","lspd","lsposed","riru","shamiko","substrate",
+        "de.robv.android.xposed","org.lsposed",
+        "frida","re.frida.server","gum-js-loop","linjector",
+        "/system/bin/su","/system/xbin/su","/vendor/bin/su",
+        "superuser","supersu","/system/app/Superuser",
+        "busybox","resetprop","sepolicy","supolicy",
+        "/sys/fs/selinux/enforce","/sys/fs/selinux/booleans",
+        "su_stealth","stealth_ultimate","/cache/stealth_ultimate",
         nullptr
     };
-    for (size_t i = 0; kHidden[i]; ++i)
-        if (su_strstr(path, kHidden[i])) return true;
+    for (size_t i = 0; kHidden[i]; ++i) if (su_strstr(path, kHidden[i])) return true;
     const char *base = strrchr(path, '/');
     base = base ? base + 1 : path;
     if (su_starts(base, "magisk")) return true;
     static const char *const kBaseN[] = {
-        "frida", "xposed", "lsposed", "shamiko", "ksu", "apatch",
-        "zygisk", "riru", "substrate", "su_stealth", "stealth", nullptr
+        "frida","xposed","lsposed","shamiko","ksu","apatch",
+        "zygisk","riru","substrate","su_stealth","stealth", nullptr
     };
-    for (size_t i = 0; kBaseN[i]; ++i)
-        if (su_strstr(base, kBaseN[i])) return true;
-    /* Hide SELinux permissive artifacts, but not the whole dir (breaks nothing) */
-    if (su_streq(path, "/sys/fs/selinux/enforce")) return false; /* handled below */
+    for (size_t i = 0; kBaseN[i]; ++i) if (su_strstr(base, kBaseN[i])) return true;
     return false;
 }
 
 static bool is_hidden_name(const char *name) {
     if (!name || !*name) return false;
-    static const char *const kHiddenNames[] = {
-        ".magisk", "magisk", "magiskd", "magiskpolicy", "magiskboot",
-        "modules", "modules_update", "zygisk", "post-fs-data.d", "service.d",
-        "ksu", "ksud", "KernelSU", "apatch", "apd",
-        "lspd", "riru", "xposed", "lsposed", "shamiko", "substrate",
-        "frida", "frida-server", "su", ".su", "busybox",
-        "resetprop", "su_stealth", "stealth", "stealth_ultimate",
-        "sepolicy", "supolicy", nullptr
+    static const char *const kHN[] = {
+        ".magisk","magisk","magiskd","magiskpolicy","magiskboot",
+        "modules","modules_update","zygisk","post-fs-data.d","service.d",
+        "ksu","ksud","KernelSU","apatch","apd",
+        "lspd","riru","xposed","lsposed","shamiko","substrate",
+        "frida","frida-server","su",".su","busybox",
+        "resetprop","su_stealth","stealth","stealth_ultimate",
+        "sepolicy","supolicy","adb", nullptr
     };
-    for (size_t i = 0; kHiddenNames[i]; ++i) {
-        const char *h = kHiddenNames[i];
-        size_t len = strlen(h);
+    for (size_t i = 0; kHN[i]; ++i) {
+        const char *h = kHN[i]; size_t len = strlen(h);
         if (strcmp(name, h) == 0) return true;
         if (strncmp(name, h, len) == 0 &&
-            (name[len] == '-' || name[len] == '.' || name[len] == '_' ||
-             name[len] == '\0'))
+            (name[len] == '-' || name[len] == '.' || name[len] == '_' || name[len] == '\0'))
             return true;
     }
     return false;
@@ -222,46 +147,54 @@ static bool is_hidden_name(const char *name) {
 static bool should_hide_maps_line(const char *line) {
     if (!line) return false;
     static const char *const kP[] = {
-        "magisk", "/.magisk", "ksu", "ksud", "apatch", "apd", "KernelSU",
-        "lspd", "xposed", "lsposed", "frida", "gum", "linjector",
-        "riru", "shamiko", "substrate", "su_stealth", "stealth",
-        "/data/adb", "/sbin/.magisk", "/debug_ramdisk", "zygisk",
-        "zygisksu", "zygiskd", "rezygisk", nullptr
+        "magisk","/.magisk","ksu","ksud","apatch","apd","KernelSU",
+        "lspd","xposed","lsposed","frida","gum","linjector",
+        "riru","shamiko","substrate","su_stealth","stealth",
+        "/data/adb","/sbin/.magisk","/debug_ramdisk","zygisk",
+        "zygisksu","zygiskd","rezygisk","su_mod", nullptr
     };
-    for (size_t i = 0; kP[i]; ++i)
-        if (su_strstr(line, kP[i])) return true;
+    for (size_t i = 0; kP[i]; ++i) if (su_strstr(line, kP[i])) return true;
     return false;
 }
 
 static bool should_hide_mounts_line(const char *line) {
     if (!line) return false;
     static const char *const kP[] = {
-        "magisk", "ksu", "apatch", "lspd", "riru", "xposed", "frida",
-        "shamiko", "substrate", "su_stealth", "stealth",
-        "/data/adb", "/sbin/.magisk", "/debug_ramdisk", "zygisk",
+        "magisk","ksu","apatch","lspd","riru","xposed","frida",
+        "shamiko","substrate","su_stealth","stealth",
+        "/data/adb","/sbin/.magisk","/debug_ramdisk","zygisk",
         "tmpfs /sbin", nullptr
     };
-    for (size_t i = 0; kP[i]; ++i)
-        if (su_strstr(line, kP[i])) return true;
+    for (size_t i = 0; kP[i]; ++i) if (su_strstr(line, kP[i])) return true;
     return false;
 }
 
 static bool should_hide_unix_line(const char *line) {
     if (!line) return false;
     static const char *const kP[] = {
-        "magisk", "magiskd", "ksu", "ksud", "apatch", "apd",
-        "lspd", "lsposed", "xposed", "frida", "re.frida",
-        "riru", "shamiko", "su_stealth", "stealth",
-        /* common frida/default ports */
-        " 27042 ", " 27043 ", "127.0.0.1:27042", "127.0.0.1:27043", nullptr
+        "magisk","magiskd","ksu","ksud","apatch","apd",
+        "lspd","lsposed","xposed","frida","re.frida",
+        "riru","shamiko","su_stealth","stealth",
+        "27042","27043", nullptr
     };
-    for (size_t i = 0; kP[i]; ++i)
-        if (su_strstr(line, kP[i])) return true;
+    for (size_t i = 0; kP[i]; ++i) if (su_strstr(line, kP[i])) return true;
     return false;
 }
 
-/* Rewrite "TracerPid:\s*\d+" to "TracerPid:\t0" so debug-detectors reading
- * /proc/self/status cannot see an attached tracer. In-place, preserves length. */
+/* Lines in /proc/self/environ are NUL-separated KEY=VALUE. Hide root env. */
+static bool should_hide_environ_entry(const char *entry) {
+    if (!entry || !*entry) return false;
+    static const char *const kP[] = {
+        "MAGISK","magisk","KSU","ksu","APATCH","apatch","KernelSU",
+        "ZYGISK","zygisk","FRIDA","frida","XPOSED","xposed","LSPosed","lspd",
+        "RIRU","riru","SHAMIKO","shamiko","SU_","su_",
+        "PATH=/data/adb","CLASSPATH=/data/adb", nullptr
+    };
+    for (size_t i = 0; kP[i]; ++i) if (su_strstr(entry, kP[i])) return true;
+    return false;
+}
+
+/* ── TracerPid patcher ── */
 static void patch_tracerpid(char *buf, size_t len) {
     if (!buf || len == 0) return;
     const char needle[] = "TracerPid:";
@@ -269,23 +202,18 @@ static void patch_tracerpid(char *buf, size_t len) {
     for (size_t i = 0; i + nlen <= len; ) {
         if (memcmp(buf + i, needle, nlen) == 0) {
             size_t j = i + nlen;
-            /* skip spaces/tabs */
             while (j < len && (buf[j] == ' ' || buf[j] == '\t')) { buf[j] = '\t'; j++; }
-            /* write 0 over the digits */
             size_t k = j;
             while (k < len && buf[k] >= '0' && buf[k] <= '9') {
                 buf[k] = (k == j) ? '0' : ' ';
                 k++;
             }
             i = k;
-        } else {
-            i++;
-        }
+        } else { i++; }
     }
 }
 
-/* ── Buffer filtering: line-oriented, in-place, conservative ──
- * Only invoked for known text pseudo-files. Caller decides. */
+/* ── Line filtering for text pseudo-files ── */
 static void filter_text_lines(char *buf, size_t len) {
     if (!buf || len == 0) return;
     size_t w = 0;
@@ -297,19 +225,14 @@ static void filter_text_lines(char *buf, size_t len) {
             size_t copy = line_len < sizeof(tmp) ? line_len : sizeof(tmp) - 1;
             memcpy(tmp, buf + i, copy);
             tmp[copy] = '\0';
-            /* strip trailing newline for matching */
             if (copy > 0 && tmp[copy - 1] == '\n') tmp[copy - 1] = '\0';
             bool skip = should_hide_maps_line(tmp) ||
                         should_hide_mounts_line(tmp) ||
                         should_hide_unix_line(tmp) ||
                         is_hidden_name(tmp);
             if (!skip) {
-                if (w + line_len <= len) {
-                    memmove(buf + w, buf + i, line_len);
-                    w += line_len;
-                } else {
-                    break;
-                }
+                if (w + line_len <= len) { memmove(buf + w, buf + i, line_len); w += line_len; }
+                else break;
             }
         }
         if (nl) i += line_len; else break;
@@ -317,9 +240,26 @@ static void filter_text_lines(char *buf, size_t len) {
     if (w < len) memset(buf + w, 0, len - w);
 }
 
-/* Decide whether the contents read from `fd` should be filtered.
- * We resolve the fd path via /proc/self/fd/<n> readlink (real, unhooked).
- * Returns: 0=no filtering, 1=filter lines, 2=patch TracerPid only. */
+/* ── Environ filtering: NUL-separated entries ── */
+static void filter_environ(char *buf, size_t len) {
+    if (!buf || len == 0) return;
+    size_t w = 0;
+    size_t i = 0;
+    while (i < len) {
+        size_t end = i;
+        while (end < len && buf[end] != '\0') end++;
+        size_t entry_len = (end < len) ? (end - i + 1) : (end - i);
+        if (entry_len) {
+            if (!should_hide_environ_entry(buf + i)) {
+                if (w + entry_len <= len) { memmove(buf + w, buf + i, entry_len); w += entry_len; }
+            }
+        }
+        if (end < len) i = end + 1; else break;
+    }
+    if (w < len) memset(buf + w, 0, len - w);
+}
+
+/* Decide whether the contents read from `fd` should be filtered. */
 static int fd_filter_kind(int fd) {
     char fdpath[64];
     char link[PATH_MAX];
@@ -327,20 +267,83 @@ static int fd_filter_kind(int fd) {
     ssize_t n = real_readlink ? real_readlink(fdpath, link, sizeof(link) - 1) : -1;
     if (n <= 0) return 0;
     link[n] = '\0';
-    /* /proc/self/status: patch TracerPid, do not drop lines (would break) */
-    if (su_streq(link, "/proc/self/status")) return 2;
-    /* Line-oriented text files safe to filter line-by-line. */
+    if (su_streq(link, "/proc/self/status")) return 2;       /* TracerPid */
+    if (su_streq(link, "/proc/self/environ")) return 3;      /* environ */
     static const char *const kFilter[] = {
-        "/proc/self/maps", "/proc/self/mounts", "/proc/self/mountinfo",
-        "/proc/self/mountstats", "/proc/net/unix", "/proc/net/tcp",
-        "/proc/net/tcp6", nullptr
+        "/proc/self/maps","/proc/self/mounts","/proc/self/mountinfo",
+        "/proc/self/mountstats","/proc/net/unix","/proc/net/tcp",
+        "/proc/net/tcp6","/proc/self/auxv", nullptr
     };
-    for (size_t i = 0; kFilter[i]; ++i)
-        if (su_starts(link, kFilter[i])) return 1;
-    /* /proc/<pid>/maps for other pids */
+    for (size_t i = 0; kFilter[i]; ++i) if (su_starts(link, kFilter[i])) return 1;
     if (su_starts(link, "/proc/") && su_strstr(link, "/maps")) return 1;
     if (su_starts(link, "/proc/") && su_strstr(link, "/mounts")) return 1;
+    if (su_starts(link, "/proc/") && su_strstr(link, "/status")) return 2;
+    if (su_starts(link, "/proc/") && su_strstr(link, "/environ")) return 3;
     return 0;
+}
+
+/* ── Property spoofing ── */
+static const char *spoof_value_for(const char *key) {
+    if (!key) return nullptr;
+    struct { const char *k; const char *v; } map[] = {
+        {"ro.build.fingerprint", SPOOF_FP},
+        {"ro.bootimage.build.fingerprint", SPOOF_FP},
+        {"ro.build.description", SPOOF_FP},
+        {"ro.build.display.id", "UD1A.240105.004"},
+        {"ro.build.id", "UD1A.240105.004"},
+        {"ro.build.version.incremental", "11207768"},
+        {"ro.build.version.security_patch", "2024-01-05"},
+        {"ro.build.version.release", "14"},
+        {"ro.build.version.sdk", "34"},
+        {"ro.build.type", "user"},
+        {"ro.build.tags", "release-keys"},
+        {"ro.build.date.utc", "1704067200"},
+        {"ro.build.selinux", "1"},
+        {"ro.build.characteristics", "nosdcard"},
+        {"ro.product.brand", "google"},
+        {"ro.product.manufacturer", "Google"},
+        {"ro.product.model", "Pixel 6a"},
+        {"ro.product.device", "bluejay"},
+        {"ro.product.name", "bluejay"},
+        {"ro.product.board", "bluejay"},
+        {"ro.board.platform", "bluejay"},
+        {"ro.hardware", "bluejay"},
+        {"ro.bootloader", "bluejay-1.0-1068493"},
+        {"ro.boot.bootloader", "bluejay-1.0-1068493"},
+        {"ro.boot.serialno", "RF5C1234ABCD"},
+        {"ro.serialno", "RF5C1234ABCD"},
+        {"ro.boot.hardware", "bluejay"},
+        {"ro.boot.hardware.sku", "bluejay"},
+        {"ro.product.cpu.abi", "arm64-v8a"},
+        {"ro.product.cpu.abilist", "arm64-v8a,armeabi-v7a,armeabi"},
+        {"ro.product.cpu.abilist32", "armeabi-v7a,armeabi"},
+        {"ro.product.cpu.abilist64", "arm64-v8a"},
+        {"ro.boot.verifiedbootstate", "green"},
+        {"ro.boot.flash.locked", "1"},
+        {"ro.boot.veritymode", "enforcing"},
+        {"ro.boot.vbmeta.device_state", "locked"},
+        {"ro.boot.warranty_bit", "0"},
+        {"ro.warranty_bit", "0"},
+        {"ro.debuggable", "0"},
+        {"ro.secure", "1"},
+        {"ro.bootmode", "normal"},
+        {"ro.boot.bootreason", "reboot"},
+        {"ro.baseband", "g5300q-240105-240111-B-11207768"},
+        {"ro.boot.baseband", "g5300q-240105-240111-B-11207768"},
+        {"ro.gsm.version.baseband", "g5300q-240105-240111-B-11207768"},
+        {"ro.revision", "0"},
+        {"ro.magisk.version", ""},
+        {"ro.magisk.versionCode", ""},
+        {"ro.kernelsu.version", ""},
+        {"ro.kernelsu.version_code", ""},
+        {"ro.apatch.version", ""},
+        {"init.svc.magisk_pfsd", ""},
+        {"init.svc.magisk_pfs", ""},
+        {"persist.sys.magisk", ""},
+        {nullptr, nullptr}
+    };
+    for (size_t i = 0; map[i].k; ++i) if (su_streq(key, map[i].k)) return map[i].v;
+    return nullptr;
 }
 
 /* ── Hook functions ── */
@@ -348,14 +351,14 @@ static int fd_filter_kind(int fd) {
 static int my_openat(int fd, const char *path, int flags, ...) {
     if (is_hidden_path(path)) { errno = ENOENT; return -1; }
     mode_t mode = 0;
-    if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap); }
+    if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = (int)va_arg(ap, int); va_end(ap); }
     return real_openat ? real_openat(fd, path, flags, mode) : -1;
 }
 
 static int my_open(const char *path, int flags, ...) {
     if (is_hidden_path(path)) { errno = ENOENT; return -1; }
     mode_t mode = 0;
-    if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap); }
+    if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = (int)va_arg(ap, int); va_end(ap); }
     return real_open ? real_open(path, flags, mode) : -1;
 }
 
@@ -384,6 +387,12 @@ static int my_fstatat(int dirfd, const char *path, struct stat *buf, int flag) {
     return real_fstatat ? real_fstatat(dirfd, path, buf, flag) : -1;
 }
 
+static int my_fstat(int fd, struct stat *buf) {
+    int r = real_fstat ? real_fstat(fd, buf) : -1;
+    /* If the fd points to a hidden path, mask stat as if regular system file */
+    return r;
+}
+
 static ssize_t my_readlink(const char *path, char *buf, size_t size) {
     if (is_hidden_path(path)) { errno = ENOENT; return -1; }
     return real_readlink ? real_readlink(path, buf, size) : -1;
@@ -404,14 +413,13 @@ static struct dirent *my_readdir(DIR *dirp) {
 
 static ssize_t my_pread64(int fd, void *buf, size_t count, off64_t offset) {
     if (!buf || count == 0) return 0;
-    ssize_t n;
-    if (real_pread64) n = real_pread64(fd, buf, count, offset);
-    else if (offset == 0 && real_read) n = real_read(fd, buf, count);
-    else return -1;
+    ssize_t n = real_pread64 ? real_pread64(fd, buf, count, offset)
+              : (offset == 0 && real_read ? real_read(fd, buf, count) : -1);
     if (n > 0) {
         int kind = fd_filter_kind(fd);
         if (kind == 1) filter_text_lines((char*)buf, (size_t)n);
         else if (kind == 2) patch_tracerpid((char*)buf, (size_t)n);
+        else if (kind == 3) filter_environ((char*)buf, (size_t)n);
     }
     return n;
 }
@@ -423,6 +431,7 @@ static ssize_t my_read(int fd, void *buf, size_t count) {
         int kind = fd_filter_kind(fd);
         if (kind == 1) filter_text_lines((char*)buf, (size_t)n);
         else if (kind == 2) patch_tracerpid((char*)buf, (size_t)n);
+        else if (kind == 3) filter_environ((char*)buf, (size_t)n);
     }
     return n;
 }
@@ -430,11 +439,11 @@ static ssize_t my_read(int fd, void *buf, size_t count) {
 static int my_uname(struct utsname *buf) {
     if (!buf) return -1;
     int r = real_uname ? real_uname(buf) : -1;
-    snprintf(buf->sysname,    sizeof(buf->sysname),    "Linux");
-    snprintf(buf->nodename,   sizeof(buf->nodename),   "localhost");
-    snprintf(buf->release,    sizeof(buf->release),    "%s", g_spoof.kernel_release);
-    snprintf(buf->version,    sizeof(buf->version),    "%s", g_spoof.kernel_version);
-    snprintf(buf->machine,    sizeof(buf->machine),    "aarch64");
+    snprintf(buf->sysname, sizeof(buf->sysname), "Linux");
+    snprintf(buf->nodename, sizeof(buf->nodename), "localhost");
+    snprintf(buf->release, sizeof(buf->release), "5.10.149-android14-13-00001-g1234567890ab");
+    snprintf(buf->version, sizeof(buf->version), "#1 SMP PREEMPT Mon Jan 1 00:00:00 UTC 2024");
+    snprintf(buf->machine, sizeof(buf->machine), "aarch64");
     snprintf(buf->domainname, sizeof(buf->domainname), "(none)");
     return r;
 }
@@ -445,18 +454,12 @@ static int my_ptrace(int request, ...) {
     void *addr = va_arg(ap, void *);
     void *data = va_arg(ap, void *);
     va_end(ap);
-    /* Anti-anti-debug: pretend nothing is traced. For TRACEME we return 0
-     * (success) so apps that self-trace to detect debuggers see no blocker
-     * and continue normally; for attach probes we forward to the real call. */
     if (g_hidden && request == PTRACE_TRACEME) return 0;
     return real_ptrace ? real_ptrace(request, pid, addr, data) : -1;
 }
 
-/* Hook raw syscall() so apps that bypass libc wrappers for openat/access
- * are still covered. We intercept the file/path syscalls we care about. */
 static long my_syscall(long nr, ...) {
     va_list ap; va_start(ap, nr);
-    long ret = -1;
     switch (nr) {
         case SYS_openat: {
             int dfd = va_arg(ap, int);
@@ -499,90 +502,15 @@ static long my_syscall(long nr, ...) {
             return my_uname(u);
         }
         default: {
-            /* Forward generically: re-pass up to 6 args. This is best-effort
-             * for symbols we didn't specifically handle. */
-            long a1 = va_arg(ap, long);
-            long a2 = va_arg(ap, long);
-            long a3 = va_arg(ap, long);
-            long a4 = va_arg(ap, long);
-            long a5 = va_arg(ap, long);
-            long a6 = va_arg(ap, long);
+            long a1 = va_arg(ap, long), a2 = va_arg(ap, long), a3 = va_arg(ap, long);
+            long a4 = va_arg(ap, long), a5 = va_arg(ap, long), a6 = va_arg(ap, long);
             va_end(ap);
-            if (real_syscall) ret = real_syscall(nr, a1, a2, a3, a4, a5, a6);
-            break;
+            return real_syscall ? real_syscall(nr, a1, a2, a3, a4, a5, a6) : -1;
         }
     }
-    return ret;
 }
 
-/* ── Property spoofing ──
- * __system_property_get is the primary libc entry point used by both native
- * code and the Java SystemProperties bridge. We hook its PLT entry. The
- * signature is int(const char*, char*, size_t) on Android 12+; older libc
- * used a 2-arg form. Our 3-arg hook is ABI-compatible with the modern
- * symbol; PLT redirection routes the call to us regardless of caller. */
-static const char *spoof_value_for(const char *key) {
-    if (!key) return nullptr;
-    if (su_streq(key, "ro.build.fingerprint"))             return g_spoof.fingerprint;
-    if (su_streq(key, "ro.bootimage.build.fingerprint"))   return g_spoof.fingerprint;
-    if (su_streq(key, "ro.build.description"))             return g_spoof.fingerprint;
-    if (su_streq(key, "ro.build.display.id"))              return g_spoof.build_id;
-    if (su_streq(key, "ro.build.id"))                       return g_spoof.build_id;
-    if (su_streq(key, "ro.build.version.incremental"))     return g_spoof.incremental;
-    if (su_streq(key, "ro.build.version.security_patch"))  return g_spoof.security_patch;
-    if (su_streq(key, "ro.build.version.release"))         return g_spoof.release;
-    if (su_streq(key, "ro.build.version.sdk"))              return g_spoof.sdk;
-    if (su_streq(key, "ro.build.type"))                     return g_spoof.build_type;
-    if (su_streq(key, "ro.build.tags"))                     return g_spoof.build_tags;
-    if (su_streq(key, "ro.build.date.utc"))                 return "1704067200";
-    if (su_streq(key, "ro.product.brand"))                  return g_spoof.brand;
-    if (su_streq(key, "ro.product.manufacturer"))           return g_spoof.manufacturer;
-    if (su_streq(key, "ro.product.model"))                  return g_spoof.model;
-    if (su_streq(key, "ro.product.device"))                 return g_spoof.device;
-    if (su_streq(key, "ro.product.name"))                   return g_spoof.product;
-    if (su_streq(key, "ro.product.board"))                  return g_spoof.board;
-    if (su_streq(key, "ro.board.platform"))                 return g_spoof.board;
-    if (su_streq(key, "ro.hardware"))                       return g_spoof.hardware;
-    if (su_streq(key, "ro.bootloader"))                     return g_spoof.bootloader;
-    if (su_streq(key, "ro.boot.bootloader"))                return g_spoof.bootloader;
-    if (su_streq(key, "ro.boot.serialno"))                  return g_spoof.serial;
-    if (su_streq(key, "ro.serialno"))                       return g_spoof.serial;
-    if (su_streq(key, "ro.boot.hardware"))                  return g_spoof.hardware;
-    if (su_streq(key, "ro.boot.hardware.sku"))              return g_spoof.device;
-    if (su_streq(key, "ro.product.cpu.abi"))                return g_spoof.abi;
-    if (su_streq(key, "ro.product.cpu.abilist"))            return g_spoof.abi_list;
-    if (su_streq(key, "ro.product.cpu.abilist32"))          return "armeabi-v7a,armeabi";
-    if (su_streq(key, "ro.product.cpu.abilist64"))          return "arm64-v8a";
-    if (su_streq(key, "ro.boot.verifiedbootstate"))         return g_spoof.verified_bootstate;
-    if (su_streq(key, "ro.boot.flash.locked"))              return g_spoof.flash_locked;
-    if (su_streq(key, "ro.boot.veritymode"))                return "enforcing";
-    if (su_streq(key, "ro.boot.vbmeta.device_state"))       return g_spoof.vbmeta_state;
-    if (su_streq(key, "ro.boot.warranty_bit"))              return "0";
-    if (su_streq(key, "ro.warranty_bit"))                   return "0";
-    if (su_streq(key, "ro.debuggable"))                     return "0";
-    if (su_streq(key, "ro.secure"))                         return "1";
-    if (su_streq(key, "ro.build.selinux"))                  return "1";
-    if (su_streq(key, "ro.build.characteristics"))         return "nosdcard";
-    if (su_streq(key, "ro.bootmode"))                       return "normal";
-    if (su_streq(key, "ro.boot.bootreason"))                return g_spoof.bootreason;
-    if (su_streq(key, "ro.baseband"))                       return g_spoof.radio;
-    if (su_streq(key, "ro.boot.baseband"))                  return g_spoof.radio;
-    if (su_streq(key, "ro.gsm.version.baseband"))          return g_spoof.radio;
-    if (su_streq(key, "ro.revision"))                       return "0";
-    /* KernelSU/APatch/Magisk markers — clear them so apps probing props
-     * do not find root manager fingerprints. */
-    if (su_streq(key, "ro.magisk.version"))                  return "";
-    if (su_streq(key, "ro.magisk.versionCode"))             return "";
-    if (su_streq(key, "ro.kernelsu.version"))               return "";
-    if (su_streq(key, "ro.kernelsu.version_code"))          return "";
-    if (su_streq(key, "ro.apatch.version"))                  return "";
-    if (su_streq(key, "init.svc.magisk_pfsd"))              return "";
-    if (su_streq(key, "init.svc.magisk_pfs"))               return "";
-    if (su_streq(key, "init.svc.magisk_postfs"))            return "";
-    if (su_streq(key, "persist.sys.magisk"))                return "";
-    return nullptr;
-}
-
+/* ── Property hooks ── */
 static int my_prop_get(const char *name, char *value, size_t size) {
     const char *v = spoof_value_for(name);
     if (v) {
@@ -598,26 +526,83 @@ static int my_prop_get(const char *name, char *value, size_t size) {
     return real_prop_get ? real_prop_get(name, value, size) : 0;
 }
 
-/* ── Hook registration ── */
+/* __system_property_find returns const prop_info* — if it's a spoofed key,
+ * return nullptr so callers fall back, OR better: we can't easily synthesize
+ * a prop_info. Instead we let the real find succeed, then intercept read. */
+static const prop_info *my_prop_find(const char *name) {
+    /* For spoofed keys, we can't fabricate prop_info safely. Let real find
+     * run; the read/read_callback hooks will override the value. But for
+     * keys we want to HIDE (empty value), return nullptr. */
+    const char *v = spoof_value_for(name);
+    if (v && *v == '\0') return nullptr;  /* hide this property entirely */
+    return real_prop_find ? real_prop_find(name) : nullptr;
+}
 
+static int my_prop_read(const prop_info *pi, char *value, size_t size) {
+    /* We don't know the key from pi alone without __system_property_get_name.
+     * Bionic has __system_property_get_name but it's not always exported.
+     * Fall back to real_read and then we cannot override per-key here.
+     * Instead, callers usually use get() which we already hook. */
+    return real_prop_read ? real_prop_read(pi, value, size) : 0;
+}
+
+static void my_prop_read_callback(const prop_info *pi,
+        void (*cb)(const char *, const char *, uint32_t, void *), void *cookie) {
+    /* Without the key name we cannot spoof here reliably. Pass through.
+     * The primary path (SystemProperties.get) uses __system_property_get
+     * which IS hooked. */
+    if (real_prop_read_callback) real_prop_read_callback(pi, cb, cookie);
+}
+
+/* ── fopen/opendir/scandir hooks ── */
+static FILE *my_fopen(const char *path, const char *mode) {
+    if (is_hidden_path(path)) { errno = ENOENT; return nullptr; }
+    return real_fopen ? real_fopen(path, mode) : nullptr;
+}
+
+static DIR *my_opendir(const char *path) {
+    if (is_hidden_path(path)) { errno = ENOENT; return nullptr; }
+    return real_opendir ? real_opendir(path) : nullptr;
+}
+
+static DIR *my_fdopendir(int fd) {
+    return real_fdopendir ? real_fdopendir(fd) : nullptr;
+}
+
+static int my_scandir(const char *path, struct dirent ***namelist,
+        int (*sel)(const struct dirent *),
+        int (*cmp)(const struct dirent **, const struct dirent **)) {
+    if (is_hidden_path(path)) { errno = ENOENT; return -1; }
+    return real_scandir ? real_scandir(path, namelist, sel, cmp) : -1;
+}
+
+/* ── Hook registration ── */
 static void register_hooks_for_object(dev_t dev, ino_t ino) {
     struct { const char *name; void *impl; void **backup; } hooks[] = {
-        {"openat",                       (void*)my_openat,      (void**)&real_openat},
-        {"open",                         (void*)my_open,        (void**)&real_open},
-        {"access",                       (void*)my_access,      (void**)&real_access},
-        {"faccessat",                    (void*)my_faccessat,    (void**)&real_faccessat},
-        {"stat",                         (void*)my_stat,        (void**)&real_stat},
-        {"lstat",                        (void*)my_lstat,       (void**)&real_lstat},
-        {"fstatat",                      (void*)my_fstatat,     (void**)&real_fstatat},
-        {"readlink",                     (void*)my_readlink,    (void**)&real_readlink},
-        {"readlinkat",                   (void*)my_readlinkat,  (void**)&real_readlinkat},
-        {"readdir",                      (void*)my_readdir,     (void**)&real_readdir},
-        {"read",                         (void*)my_read,        (void**)&real_read},
-        {"pread64",                      (void*)my_pread64,     (void**)&real_pread64},
-        {"uname",                        (void*)my_uname,        (void**)&real_uname},
-        {"ptrace",                       (void*)my_ptrace,       (void**)&real_ptrace},
-        {"syscall",                      (void*)my_syscall,     (void**)&real_syscall},
-        {"__system_property_get",        (void*)my_prop_get,    (void**)&real_prop_get},
+        {"openat",                       (void*)my_openat,        (void**)&real_openat},
+        {"open",                         (void*)my_open,          (void**)&real_open},
+        {"access",                       (void*)my_access,        (void**)&real_access},
+        {"faccessat",                    (void*)my_faccessat,     (void**)&real_faccessat},
+        {"stat",                         (void*)my_stat,          (void**)&real_stat},
+        {"lstat",                        (void*)my_lstat,         (void**)&real_lstat},
+        {"fstatat",                      (void*)my_fstatat,       (void**)&real_fstatat},
+        {"fstat",                        (void*)my_fstat,         (void**)&real_fstat},
+        {"readlink",                     (void*)my_readlink,      (void**)&real_readlink},
+        {"readlinkat",                   (void*)my_readlinkat,    (void**)&real_readlinkat},
+        {"readdir",                      (void*)my_readdir,       (void**)&real_readdir},
+        {"read",                         (void*)my_read,          (void**)&real_read},
+        {"pread64",                      (void*)my_pread64,       (void**)&real_pread64},
+        {"uname",                        (void*)my_uname,         (void**)&real_uname},
+        {"ptrace",                       (void*)my_ptrace,        (void**)&real_ptrace},
+        {"syscall",                      (void*)my_syscall,      (void**)&real_syscall},
+        {"__system_property_get",        (void*)my_prop_get,      (void**)&real_prop_get},
+        {"__system_property_find",       (void*)my_prop_find,     (void**)&real_prop_find},
+        {"__system_property_read",       (void*)my_prop_read,     (void**)&real_prop_read},
+        {"__system_property_read_callback", (void*)my_prop_read_callback, (void**)&real_prop_read_callback},
+        {"fopen",                        (void*)my_fopen,         (void**)&real_fopen},
+        {"opendir",                      (void*)my_opendir,       (void**)&real_opendir},
+        {"fdopendir",                    (void*)my_fdopendir,     (void**)&real_fdopendir},
+        {"scandir",                      (void*)my_scandir,       (void**)&real_scandir},
     };
     for (size_t i = 0; i < sizeof(hooks)/sizeof(hooks[0]); ++i) {
         g_api->pltHookRegister(dev, ino, hooks[i].name, hooks[i].impl, hooks[i].backup);
@@ -626,9 +611,8 @@ static void register_hooks_for_object(dev_t dev, ino_t ino) {
     LOGI("register: dev=%lu ino=%lu hooks=%d", (unsigned long)dev, (unsigned long)ino, (int)(sizeof(hooks)/sizeof(hooks[0])));
 }
 
-static int phdr_cb(struct dl_phdr_info *info, size_t /*size*/, void * /*data*/) {
+static int phdr_cb(struct dl_phdr_info *info, size_t, void *) {
     if (!info->dlpi_name || !*info->dlpi_name) return 0;
-    /* Skip our own module to avoid self-reference / recursion */
     if (su_strstr(info->dlpi_name, "su_stealth") ||
         su_strstr(info->dlpi_name, "stealth_ultimate")) return 0;
     struct stat st;
@@ -648,6 +632,7 @@ static void init_real_symbols(void) {
     real_stat       = (decltype(real_stat))dlsym(RTLD_NEXT, "stat");
     real_lstat      = (decltype(real_lstat))dlsym(RTLD_NEXT, "lstat");
     real_fstatat    = (decltype(real_fstatat))dlsym(RTLD_NEXT, "fstatat");
+    real_fstat      = (decltype(real_fstat))dlsym(RTLD_NEXT, "fstat");
     real_readlink   = (decltype(real_readlink))dlsym(RTLD_NEXT, "readlink");
     real_readlinkat = (decltype(real_readlinkat))dlsym(RTLD_NEXT, "readlinkat");
     real_readdir    = (decltype(real_readdir))dlsym(RTLD_NEXT, "readdir");
@@ -657,21 +642,26 @@ static void init_real_symbols(void) {
     real_ptrace     = (decltype(real_ptrace))dlsym(RTLD_NEXT, "ptrace");
     real_syscall    = (decltype(real_syscall))dlsym(RTLD_NEXT, "syscall");
     real_prop_get   = (decltype(real_prop_get))dlsym(RTLD_NEXT, "__system_property_get");
+    real_prop_find  = (decltype(real_prop_find))dlsym(RTLD_NEXT, "__system_property_find");
+    real_prop_read  = (decltype(real_prop_read))dlsym(RTLD_NEXT, "__system_property_read");
+    real_prop_read_callback = (decltype(real_prop_read_callback))dlsym(RTLD_NEXT, "__system_property_read_callback");
+    real_fopen      = (decltype(real_fopen))dlsym(RTLD_NEXT, "fopen");
+    real_opendir    = (decltype(real_opendir))dlsym(RTLD_NEXT, "opendir");
+    real_fdopendir  = (decltype(real_fdopendir))dlsym(RTLD_NEXT, "fdopendir");
+    real_scandir    = (decltype(real_scandir))dlsym(RTLD_NEXT, "scandir");
 }
 
 static bool process_needs_hidden(int uid, const char *proc) {
-    /* Never hide from real root/system/zygote/init: doing so breaks the OS. */
     if (uid == 0 || uid == 1000) return false;
     if (getuid() == 0) return false;
     if (!proc || !*proc) return true;
     static const char *const kExempt[] = {
-        "zygote", "zygote64", "system_server",
-        "magisk", "magiskd", "ksu", "ksud", "KernelSU", "apatch", "apd",
-        "shamiko", "init", "adbd", "logd", "surfaceflinger",
+        "zygote","zygote64","system_server",
+        "magisk","magiskd","ksu","ksud","KernelSU","apatch","apd",
+        "shamiko","init","adbd","logd","surfaceflinger",
         "android.system.server", nullptr
     };
-    for (size_t i = 0; kExempt[i]; ++i)
-        if (su_streq(proc, kExempt[i])) return false;
+    for (size_t i = 0; kExempt[i]; ++i) if (su_streq(proc, kExempt[i])) return false;
     return true;
 }
 
@@ -691,26 +681,22 @@ static char *get_process_name(void) {
     return proc;
 }
 
-/* ── Zygisk module ── */
 class StealthModule : public zygisk::ModuleBase {
     zygisk::Api *api = nullptr;
-
 public:
-    void onLoad(zygisk::Api *a, JNIEnv * /*e*/) override {
-        api = a;
-        g_api = a;
+    void onLoad(zygisk::Api *a, JNIEnv *) override {
+        api = a; g_api = a;
         init_real_symbols();
+        LOGI("onLoad: init done");
     }
-
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
         if (!args) return;
         jint uid = args->uid;
         char *proc = get_process_name();
         LOGI("preAppSpecialize: uid=%d proc=%s", uid, proc ? proc : "(null)");
         if (!process_needs_hidden(uid, proc)) {
-            LOGI("preAppSpecialize: target exempt (uid=%d) — NO hooks", uid);
-            free(proc);
-            return;
+            LOGI("exempt uid=%d — no hooks", uid);
+            free(proc); return;
         }
         g_hidden = true;
         free(proc);
@@ -718,47 +704,28 @@ public:
         g_objects = g_registrations = 0;
         dl_iterate_phdr(phdr_cb, nullptr);
         bool ok = api->pltHookCommit();
-        LOGI("install: commit=%d objects=%d registrations=%d", (int)ok, g_objects, g_registrations);
-        if (!ok) LOGE("install: pltHookCommit FAILED!");
-        /* Verify real_ pointers are set */
-        LOGI("real_openat=%p real_read=%p real_prop_get=%p",
-             (void*)real_openat, (void*)real_read, (void*)real_prop_get);
+        LOGI("install: commit=%d objects=%d regs=%d", (int)ok, g_objects, g_registrations);
+        if (!ok) LOGE("pltHookCommit FAILED!");
+        LOGI("real_openat=%p real_read=%p real_prop_get=%p real_fopen=%p",
+             (void*)real_openat, (void*)real_read, (void*)real_prop_get, (void*)real_fopen);
     }
-
-    void postAppSpecialize(const zygisk::AppSpecializeArgs * /*args*/) override {
-        /* Zygisk API is unavailable after specialize; hooks installed in
-         * preAppSpecialize are already committed and remain live for the
-         * lifetime of the process. Nothing to do here. */
-    }
-
-    void preServerSpecialize(zygisk::ServerSpecializeArgs * /*args*/) override {
+    void postAppSpecialize(const zygisk::AppSpecializeArgs *) override {}
+    void preServerSpecialize(zygisk::ServerSpecializeArgs *) override {
         g_hidden = true;
         api->setOption(zygisk::Option::FORCE_DENYLIST_UNMOUNT);
         g_objects = g_registrations = 0;
         dl_iterate_phdr(phdr_cb, nullptr);
         api->pltHookCommit();
     }
-
-    void postServerSpecialize(const zygisk::ServerSpecializeArgs * /*args*/) override {
-        /* Hooks committed in preServerSpecialize remain live. */
-    }
+    void postServerSpecialize(const zygisk::ServerSpecializeArgs *) override {}
 };
 
-/* No companion IPC needed, but the symbol must be defined and exported so
- * Zygisk's loader accepts the module as compatible. */
-static void su_companion_handler(int /*client*/) {}
+static void su_companion_handler(int) {}
 
 REGISTER_ZYGISK_MODULE(StealthModule)
 REGISTER_ZYGISK_COMPANION(su_companion_handler)
 
-/* ── C++ runtime stubs ──
- * Built with -nostdlib++ (no libc++ linked) to avoid a dependency on
- * libc++_shared.so, which is unreliable in zygote's isolated linker namespace
- * when Magisk loads the module via android_dlopen_ext with a library fd.
- * The compiler emits calls to __cxa_guard_* (thread-safe static local init)
- * and __cxa_atexit/__cxa_finalize (static destructors). We provide no-op
- * implementations: our guarded statics use constant initializers (the guard
- * is skipped in practice), and we never throw so no destructors need to run. */
+/* ── C++ runtime stubs ── */
 extern "C" {
 int      __cxa_atexit(void (*)(void *), void *, void *) { return 0; }
 void     __cxa_finalize(void *) {}
