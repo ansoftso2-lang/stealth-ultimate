@@ -744,35 +744,5 @@ public:
  * Zygisk's loader accepts the module as compatible. */
 static void su_companion_handler(int /*client*/) {}
 
-/* Ensure the Zygisk entry points are exported with default visibility so
- * dlsym in zygote can find them. The upstream macros do not attach an
- * explicit visibility attribute; depending on build flags the symbols can
- * end up hidden, which makes Magisk reject the module as incompatible. */
-#undef REGISTER_ZYGISK_MODULE
-#undef REGISTER_ZYGISK_COMPANION
-#define REGISTER_ZYGISK_MODULE(clazz) \
-    extern "C" __attribute__((visibility("default"))) \
-    void zygisk_module_entry(zygisk::internal::api_table *table, JNIEnv *env) { \
-        zygisk::internal::entry_impl<clazz>(table, env); \
-    }
-#define REGISTER_ZYGISK_COMPANION(func) \
-    extern "C" __attribute__((visibility("default"))) \
-    void zygisk_companion_entry(int client) { func(client); }
-
 REGISTER_ZYGISK_MODULE(StealthModule)
 REGISTER_ZYGISK_COMPANION(su_companion_handler)
-
-/* ── C++ runtime stubs ──
- * No libc++ is linked (-fno-exceptions -fno-rtti, no libc++_static.a).
- * The compiler still emits calls to __cxa_guard_* (thread-safe static local
- * init) and __cxa_atexit/__cxa_finalize (static destructors). We provide
- * trivial no-op implementations so the link succeeds with --no-undefined.
- * Our guarded statics are initialized with constant values, so skipping the
- * guard is safe; we never throw, so no destructors need to run. */
-extern "C" {
-int    __cxa_atexit(void (*)(void *), void *, void *) { return 0; }
-void   __cxa_finalize(void *) {}
-unsigned __cxa_guard_acquire(unsigned *g) { (void)g; return 0; }
-void   __cxa_guard_release(unsigned *g) { (void)g; }
-void   __cxa_guard_abort(unsigned *g) { (void)g; }
-}
