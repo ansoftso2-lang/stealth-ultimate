@@ -51,8 +51,8 @@
 
 #include "zygisk.hpp"
 
-/* ── Silent logging: only during early bring-up, never after specialize ── */
-#define SU_ENABLE_LOG 0
+/* ── Logging: enabled to diagnose hook installation ── */
+#define SU_ENABLE_LOG 1
 #if SU_ENABLE_LOG
 #include <android/log.h>
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  "su_mod", __VA_ARGS__)
@@ -623,6 +623,7 @@ static void register_hooks_for_object(dev_t dev, ino_t ino) {
         g_api->pltHookRegister(dev, ino, hooks[i].name, hooks[i].impl, hooks[i].backup);
     }
     g_registrations += (int)(sizeof(hooks)/sizeof(hooks[0]));
+    LOGI("register: dev=%lu ino=%lu hooks=%d", (unsigned long)dev, (unsigned long)ino, (int)(sizeof(hooks)/sizeof(hooks[0])));
 }
 
 static int phdr_cb(struct dl_phdr_info *info, size_t /*size*/, void * /*data*/) {
@@ -631,10 +632,9 @@ static int phdr_cb(struct dl_phdr_info *info, size_t /*size*/, void * /*data*/) 
     if (su_strstr(info->dlpi_name, "su_stealth") ||
         su_strstr(info->dlpi_name, "stealth_ultimate")) return 0;
     struct stat st;
-    /* Use real_stat once resolved; before hook commit this is libc stat which
-     * is safe because we have not installed our wrappers yet. */
     if (stat(info->dlpi_name, &st) != 0) return 0;
     if (st.st_dev == 0 || st.st_ino == 0) return 0;
+    LOGI("phdr: %s dev=%lu ino=%lu", info->dlpi_name, (unsigned long)st.st_dev, (unsigned long)st.st_ino);
     register_hooks_for_object(st.st_dev, st.st_ino);
     g_objects++;
     return 0;
@@ -706,19 +706,23 @@ public:
         if (!args) return;
         jint uid = args->uid;
         char *proc = get_process_name();
+        LOGI("preAppSpecialize: uid=%d proc=%s", uid, proc ? proc : "(null)");
         if (!process_needs_hidden(uid, proc)) {
+            LOGI("preAppSpecialize: target exempt (uid=%d) — NO hooks", uid);
             free(proc);
             return;
         }
         g_hidden = true;
         free(proc);
-        /* Ask Zygisk to unmount Magisk/module mounts in this process. This is
-         * the canonical way to hide mounts and is compatible with Zygisk. */
         api->setOption(zygisk::Option::FORCE_DENYLIST_UNMOUNT);
         g_objects = g_registrations = 0;
         dl_iterate_phdr(phdr_cb, nullptr);
         bool ok = api->pltHookCommit();
-        LOGI("install app: ok=%d obj=%d reg=%d", (int)ok, g_objects, g_registrations);
+        LOGI("install: commit=%d objects=%d registrations=%d", (int)ok, g_objects, g_registrations);
+        if (!ok) LOGE("install: pltHookCommit FAILED!");
+        /* Verify real_ pointers are set */
+        LOGI("real_openat=%p real_read=%p real_prop_get=%p",
+             (void*)real_openat, (void*)real_read, (void*)real_prop_get);
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs * /*args*/) override {
