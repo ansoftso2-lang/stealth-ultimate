@@ -86,8 +86,6 @@ static int            (*real_getdents)(unsigned int, struct dirent *, unsigned i
 static int            (*real_openat2)(int, const char *, struct open_how *, size_t) = nullptr;
 static int            (*real_dl_iterate_phdr)(int (*)(struct dl_phdr_info *, size_t, void *), void *) = nullptr;
 static void           *(*real_mmap)(void *, size_t, int, int, int, off_t)           = nullptr;
-static int            (*real_execve)(const char *, char *const[], char *const[])     = nullptr;
-static int            (*real_execv)(const char *, char *const[])                     = nullptr;
 
 /* dl_iterate_phdr interceptor state */
 static int (*g_user_phdr_cb)(struct dl_phdr_info *, size_t, void *) = nullptr;
@@ -824,16 +822,9 @@ static void *my_mmap(void *addr, size_t length, int prot, int flags, int fd, off
     return real_mmap ? real_mmap(addr, length, prot, flags, fd, offset) : MAP_FAILED;
 }
 
-/* Block execve/execv of hidden binaries (su, magisk, busybox) */
-static int my_execve(const char *path, char *const argv[], char *const envp[]) {
-    if (is_hidden_path(path)) { errno = ENOENT; return -1; }
-    return real_execve ? real_execve(path, argv, envp) : -1;
-}
-
-static int my_execv(const char *path, char *const argv[]) {
-    if (is_hidden_path(path)) { errno = ENOENT; return -1; }
-    return real_execv ? real_execv(path, argv) : -1;
-}
+/* execve/execv hooks removed — they block su binary in processes that need
+ * root access, causing Termux/MT Manager to lose root. File path blocking
+ * via openat/access is sufficient for hiding su from detectors. */
 
 /* ── Hook registration ── */
 static void register_hooks_for_object(dev_t dev, ino_t ino) {
@@ -874,8 +865,6 @@ static void register_hooks_for_object(dev_t dev, ino_t ino) {
         {"openat2",                      (void*)my_openat2,        (void**)&real_openat2},
         {"dl_iterate_phdr",              (void*)my_dl_iterate_phdr,(void**)&real_dl_iterate_phdr},
         {"mmap",                         (void*)my_mmap,           (void**)&real_mmap},
-        {"execve",                       (void*)my_execve,         (void**)&real_execve},
-        {"execv",                        (void*)my_execv,          (void**)&real_execv},
     };
     for (size_t i = 0; i < sizeof(hooks)/sizeof(hooks[0]); ++i) {
         g_api->pltHookRegister(dev, ino, hooks[i].name, hooks[i].impl, hooks[i].backup);
@@ -979,8 +968,6 @@ static void init_real_symbols(void) {
     real_openat2    = (decltype(real_openat2))dlsym(RTLD_NEXT, "openat2");
     real_dl_iterate_phdr = (decltype(real_dl_iterate_phdr))dlsym(RTLD_NEXT, "dl_iterate_phdr");
     real_mmap       = (decltype(real_mmap))dlsym(RTLD_NEXT, "mmap");
-    real_execve     = (decltype(real_execve))dlsym(RTLD_NEXT, "execve");
-    real_execv      = (decltype(real_execv))dlsym(RTLD_NEXT, "execv");
 }
 
 /* ── JNI SystemProperties hooks ──
@@ -1053,6 +1040,12 @@ static bool is_root_management_app(const char *proc) {
         if (su_streq(proc, kRootApps[i])) return true;
         size_t len = strlen(kRootApps[i]);
         if (strncmp(proc, kRootApps[i], len) == 0 && proc[len] == ':') return true;
+    }
+    /* Also match by prefix for processes that spawn sub-processes */
+    if (su_starts(proc, "com.termux") || su_starts(proc, "bin.mt") ||
+        su_starts(proc, "com.topjohnwu.magisk") || su_starts(proc, "me.bmax.apatch") ||
+        su_starts(proc, "io.github.huskydg") || su_starts(proc, "io.github.vvb2060")) {
+        return true;
     }
     return false;
 }
