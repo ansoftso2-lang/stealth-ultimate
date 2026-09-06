@@ -856,16 +856,29 @@ public:
         }
         const char *proc = procbuf[0] ? procbuf : "unknown";
         LOGI("preAppSpecialize: uid=%d proc=%s", uid, proc);
+
+        /* Check Zygisk flags: skip processes with granted root (Magisk app,
+         * root shells, Termux with su) so we don't break su functionality.
+         * Also skip system processes. */
+        uint32_t flags = api->getFlags();
+        bool granted_root = (flags & zygisk::PROCESS_GRANTED_ROOT) != 0;
+        bool on_denylist = (flags & zygisk::PROCESS_ON_DENYLIST) != 0;
+        LOGI("flags: granted_root=%d on_denylist=%d", (int)granted_root, (int)on_denylist);
+
+        if (granted_root) {
+            LOGI("skipping (root granted) proc=%s", proc);
+            return;
+        }
         if (!process_needs_hidden(uid, proc)) {
             LOGI("exempt uid=%d proc=%s — no hooks", uid, proc);
             return;
         }
         g_hidden = true;
+        /* Force unmount Magisk traces in this process */
         api->setOption(zygisk::Option::FORCE_DENYLIST_UNMOUNT);
 
         /* JNI hook: intercept android.os.SystemProperties native methods so
-         * Java-level property reads also get spoofed values. Native Detector
-         * and many apps use SystemProperties.get() from Java. */
+         * Java-level property reads also get spoofed values. */
         JNINativeMethod propMethods[] = {
             {(char*)"get",      (char*)"(Ljava/lang/String;)Ljava/lang/String;", (void*)su_jni_prop_get},
             {(char*)"getBoolean",(char*)"(Ljava/lang/String;Z)Z",               (void*)su_jni_prop_get_boolean},
@@ -881,8 +894,6 @@ public:
         bool ok = api->pltHookCommit();
         LOGI("install: commit=%d objects=%d regs=%d proc=%s", (int)ok, g_objects, g_registrations, proc);
         if (!ok) LOGE("pltHookCommit FAILED for proc=%s!", proc);
-        LOGI("real_openat=%p real_read=%p real_prop_get=%p real_fopen=%p",
-             (void*)real_openat, (void*)real_read, (void*)real_prop_get, (void*)real_fopen);
     }
     void postAppSpecialize(const zygisk::AppSpecializeArgs *) override {}
     void preServerSpecialize(zygisk::ServerSpecializeArgs *) override {
