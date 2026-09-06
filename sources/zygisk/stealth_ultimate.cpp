@@ -938,6 +938,10 @@ static bool is_root_management_app(const char *proc) {
     return false;
 }
 
+/* Forward declarations for companion-based root UID check */
+static void load_root_uids_via_companion(zygisk::Api *api);
+static bool uid_has_root(int uid);
+
 static bool process_needs_hidden(int uid, const char *proc) {
     if (uid == 0 || uid == 1000) return false;
     if (!proc || !*proc) return true;
