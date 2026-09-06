@@ -72,69 +72,8 @@ chmod 644 "$DATA_DIR/spoof.conf" 2>/dev/null
 
 set_perm_recursive "$MODPATH" 0 0 0755 0644
 
-# ── Auto-install companion modules for 100% hiding ──
-ui_print ""
-ui_print "- Checking companion modules..."
-
-# Helper: download and install a module zip
-install_module() {
-    local name="$1"
-    local url="$2"
-    local tmpzip="/data/local/tmp/${name}.zip"
-
-    if [ -d "/data/adb/modules/$name" ]; then
-        ui_print "  = $name already installed, skipping"
-        return 0
-    fi
-
-    ui_print "  + Downloading $name..."
-    if command -v curl >/dev/null 2>&1; then
-        curl -sL "$url" -o "$tmpzip" 2>/dev/null
-    elif command -v wget >/dev/null 2>&1; then
-        wget -q "$url" -O "$tmpzip" 2>/dev/null
-    else
-        ui_print "  ! No curl/wget, skipping $name"
-        return 1
-    fi
-
-    if [ -f "$tmpzip" ] && [ $(stat -c%s "$tmpzip" 2>/dev/null || echo 0) -gt 1000 ]; then
-        ui_print "  + Installing $name..."
-        if [ "$ROOT_FW" = "magisk" ] && command -v magisk >/dev/null 2>&1; then
-            magisk --install-module "$tmpzip" 2>/dev/null
-        else
-            # Manual install: extract to /data/adb/modules/
-            mkdir -p "/data/adb/modules/$name" 2>/dev/null
-            cd "/data/adb/modules/$name" && unzip -o "$tmpzip" 2>/dev/null
-            cd /
-        fi
-        rm -f "$tmpzip"
-        ui_print "  + $name installed"
-    else
-        ui_print "  ! Failed to download $name"
-        rm -f "$tmpzip"
-        return 1
-    fi
-    return 0
-}
-
-# Shamiko — hides Zygisk ptrace + mount namespace + process traces
-SHAMIKO_URL="https://github.com/LSPosed/LSPosed.github.io/releases/download/shamiko-2.4.0-2/zygisk-shamiko-v2.4.0-2-release.zip"
-install_module "zygisk_shamiko" "$SHAMIKO_URL"
-
-# PlayIntegrityFix — spoofs Play Integrity verdicts
-PIF_URL="https://github.com/chiteraDocs/PlayIntegrityFix/releases/latest/download/PlayIntegrityFix.zip"
-install_module "playintegrityfix" "$PIF_URL"
-
-# TrickyStore — hardware key attestation spoofing
-TS_URL="https://github.com/5ec1cff/TrickyStore/releases/latest/download/TrickyStore.zip"
-install_module "tricky_store" "$TS_URL"
-
 ui_print ""
 ui_print " ================================"
 ui_print "  Installation complete."
-ui_print "  Companion modules installed:"
-ui_print "  - Shamiko (Zygisk hiding)"
-ui_print "  - PlayIntegrityFix (PI)"
-ui_print "  - TrickyStore (key attestation)"
-ui_print "  Reboot to activate all."
+ui_print "  Reboot to activate."
 ui_print " ================================"
