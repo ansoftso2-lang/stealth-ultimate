@@ -26,12 +26,17 @@ NDK_BUILD="$(find "$NDK" -maxdepth 1 -name ndk-build -print -quit)"
 BUILD_DIR="$(mktemp -d)"
 trap 'rm -rf "$BUILD_DIR"' EXIT
 
+# ndk-build discovers jni/Android.mk and jni/Application.mk relative to
+# NDK_PROJECT_PATH. Set up the standard layout so APP_STL etc. are honored.
+mkdir -p "$BUILD_DIR/jni"
+cp "$JNIDIR/Android.mk"     "$BUILD_DIR/jni/Android.mk"
+cp "$JNIDIR/Application.mk" "$BUILD_DIR/jni/Application.mk"
+cp "$JNIDIR/stealth_ultimate.cpp" "$BUILD_DIR/jni/stealth_ultimate.cpp"
+cp "$JNIDIR/zygisk.hpp"     "$BUILD_DIR/jni/zygisk.hpp"
+
 echo "Building with: $NDK_BUILD"
 "$NDK_BUILD" \
     NDK_PROJECT_PATH="$BUILD_DIR" \
-    APP_BUILD_SCRIPT="$JNIDIR/Android.mk" \
-    NDK_APPLICATION_MK="$JNIDIR/Application.mk" \
-    APP_STL=c++_static \
     V=1
 
 # ndk-build outputs to <BUILD>/libs/<abi>/libstealth.so
