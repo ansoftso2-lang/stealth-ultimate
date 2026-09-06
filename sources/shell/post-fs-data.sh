@@ -69,6 +69,9 @@ resetprop_late ro.secure "1"
 resetprop_late ro.bootmode "normal"
 resetprop_late ro.boot.bootreason "reboot"
 
+# Hide Zygisk native bridge trace
+resetprop_late ro.dalvik.vm.native.bridge "0"
+
 # Serial
 resetprop_late ro.boot.serialno "RF5C1234ABCD"
 resetprop_late ro.serialno "RF5C1234ABCD"

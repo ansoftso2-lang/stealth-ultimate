@@ -461,6 +461,15 @@ static const char *spoof_value_for(const char *key) {
         {"init.svc.magisk_pfsd", ""},
         {"init.svc.magisk_pfs", ""},
         {"persist.sys.magisk", ""},
+        /* Zygisk detection via native bridge */
+        {"ro.dalvik.vm.native.bridge", "0"},
+        /* Play Integrity Fix traces */
+        {"persist.sys.pixelprops.*", ""},
+        {"persist.sys.pixelprops.api", ""},
+        {"persist.sys.pixelprops.gms", ""},
+        {"persist.sys.pixelprops.com", ""},
+        {"persist.sys.pixelprops.retail", ""},
+        {"ro.build.fingerprint", SPOOF_FP},
         {nullptr, nullptr}
     };
     for (size_t i = 0; map[i].k; ++i) if (su_streq(key, map[i].k)) return map[i].v;
@@ -474,7 +483,8 @@ static const char *spoof_value_for(const char *key) {
 static int create_filtered_memfd(const char *path) {
     if (!path || !g_hidden) return -1;
     /* Only intercept these proc files */
-    bool is_maps = su_streq(path, "/proc/self/maps") || (su_starts(path, "/proc/") && su_strstr(path, "/maps"));
+    bool is_maps = su_streq(path, "/proc/self/maps") || su_streq(path, "/proc/self/smaps") ||
+                   (su_starts(path, "/proc/") && su_strstr(path, "/maps"));
     bool is_mountinfo = su_streq(path, "/proc/self/mountinfo") || su_streq(path, "/proc/self/mounts") ||
                         su_streq(path, "/proc/self/mountstats") ||
                         (su_starts(path, "/proc/") && su_strstr(path, "/mounts"));
