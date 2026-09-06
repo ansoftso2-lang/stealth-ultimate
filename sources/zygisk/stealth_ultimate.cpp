@@ -181,12 +181,21 @@ static bool is_hidden_name(const char *name) {
 
 static bool should_hide_maps_line(const char *line) {
     if (!line) return false;
+    /* Hide memfd and deleted entries — these are Zygisk module injection traces */
+    if (su_strstr(line, "/memfd:jit-cache") || su_strstr(line, "memfd:") ||
+        su_strstr(line, "/dev/zero (deleted)") || su_strstr(line, "[anon:")) {
+        /* Only hide if it looks like an injected lib (not normal JIT) */
+        if (su_strstr(line, "r-xp") && (su_strstr(line, "deleted") || su_strstr(line, "memfd"))) {
+            return true;
+        }
+    }
     static const char *const kP[] = {
         "magisk","/.magisk","ksu","ksud","apatch","apd","KernelSU",
         "lspd","xposed","lsposed","frida","gum","linjector",
         "riru","shamiko","substrate","su_stealth","stealth",
         "/data/adb","/sbin/.magisk","/debug_ramdisk","zygisk",
-        "zygisksu","zygiskd","rezygisk","su_mod", nullptr
+        "zygisksu","zygiskd","rezygisk","su_mod",
+        "libzygisk.so","stealth_ultimate","su_stealth", nullptr
     };
     for (size_t i = 0; kP[i]; ++i) if (su_strstr(line, kP[i])) return true;
     return false;
@@ -201,7 +210,7 @@ static bool should_hide_mounts_line(const char *line) {
         "tmpfs /sbin","/dev/block/loop",
         "errors=continue","errors=remount-ro",
         "tmpfs /data/adb","tmpfs /debug_ramdisk",
-        nullptr
+        "libzygisk.so", nullptr
     };
     for (size_t i = 0; kP[i]; ++i) if (su_strstr(line, kP[i])) return true;
     return false;
