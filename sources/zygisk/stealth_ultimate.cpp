@@ -860,33 +860,8 @@ static jlong su_jni_prop_get_long(JNIEnv *e, jclass clazz, jstring key, jlong de
     return def;
 }
 
-/* Read root-UID list created by service.sh and check if uid has root.
- * Also exempt known root management / shell apps by process name. */
-static bool uid_has_root_grant(int uid) {
-    /* Read /data/adb/su_stealth/root_uids.txt (space-separated UIDs) */
-    int fd = real_openat ? real_openat(AT_FDCWD, "/data/adb/su_stealth/root_uids.txt", O_RDONLY, 0) : -1;
-    if (fd < 0) return false;
-    char buf[1024];
-    ssize_t n = real_read ? real_read(fd, buf, sizeof(buf) - 1) : -1;
-    close(fd);
-    if (n <= 0) return false;
-    buf[n] = '\0';
-    /* Parse space-separated UIDs */
-    char *p = buf;
-    while (*p) {
-        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
-        if (!*p) break;
-        long val = 0;
-        while (*p >= '0' && *p <= '9') { val = val * 10 + (*p - '0'); p++; }
-        if (val == uid) return true;
-        while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
-    }
-    return false;
-}
-
 static bool is_root_management_app(const char *proc) {
     if (!proc) return false;
-    /* Root managers, shells, and tools that need su access — never hook */
     static const char *const kRootApps[] = {
         "com.topjohnwu.magisk", "io.github.vvb2060.magisk",
         "com.topjohnwu.magisk.kox", "me.bmax.apatch",
@@ -894,11 +869,14 @@ static bool is_root_management_app(const char *proc) {
         "bin.mt.plus", "bin.mt.plus.canary", "bin.mt.signaturekiller",
         "io.github.huskydg.magisk", "io.github.rifsxd.kitsune",
         "me.tsihngyxp.magiskkitsune", "com.konsta.mrh",
+        "com.termux.api", "com.termux.widget", "com.termux.tasker",
+        "jackpal.androidterm", "com.google.android.apps.nbu.files",
+        "com.amaze.filemanager", "me.zhanghai.android.files",
+        "com.raze.ma15", "com.raze.managers",
         nullptr
     };
     for (size_t i = 0; kRootApps[i]; ++i) {
         if (su_streq(proc, kRootApps[i])) return true;
-        /* Match sub-processes like com.termux:app */
         size_t len = strlen(kRootApps[i]);
         if (strncmp(proc, kRootApps[i], len) == 0 && proc[len] == ':') return true;
     }
@@ -908,9 +886,7 @@ static bool is_root_management_app(const char *proc) {
 static bool process_needs_hidden(int uid, const char *proc) {
     if (uid == 0 || uid == 1000) return false;
     if (!proc || !*proc) return true;
-    /* Never hook root management apps or apps with root grant */
     if (is_root_management_app(proc)) return false;
-    if (uid_has_root_grant(uid)) return false;
     static const char *const kExempt[] = {
         "zygote","zygote64","system_server",
         "magisk","magiskd","ksu","ksud","KernelSU","apatch","apd",
