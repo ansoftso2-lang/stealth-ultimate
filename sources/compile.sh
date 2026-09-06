@@ -43,7 +43,6 @@ COMMON_FLAGS=(
     -Wl,-z,global
     -Wl,-z,now
     -Wl,-z,noexecstack
-    -Wl,--exclude-libs,ALL
 )
 LIBS=(-lc -ldl -llog)
 
