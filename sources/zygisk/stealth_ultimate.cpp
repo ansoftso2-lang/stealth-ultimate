@@ -744,22 +744,20 @@ public:
  * Zygisk's loader accepts the module as compatible. */
 static void su_companion_handler(int /*client*/) {}
 
+/* Ensure the Zygisk entry points are exported with default visibility so
+ * dlsym in zygote can find them. The upstream macros do not attach an
+ * explicit visibility attribute; depending on build flags the symbols can
+ * end up hidden, which makes Magisk reject the module as incompatible. */
+#undef REGISTER_ZYGISK_MODULE
+#undef REGISTER_ZYGISK_COMPANION
+#define REGISTER_ZYGISK_MODULE(clazz) \
+    extern "C" __attribute__((visibility("default"))) \
+    void zygisk_module_entry(zygisk::internal::api_table *table, JNIEnv *env) { \
+        zygisk::internal::entry_impl<clazz>(table, env); \
+    }
+#define REGISTER_ZYGISK_COMPANION(func) \
+    extern "C" __attribute__((visibility("default"))) \
+    void zygisk_companion_entry(int client) { func(client); }
+
 REGISTER_ZYGISK_MODULE(StealthModule)
 REGISTER_ZYGISK_COMPANION(su_companion_handler)
-
-/* ── C++ runtime stubs ──
- * APP_STL=none means no libc++ is linked. The compiler still emits calls to
- * __cxa_atexit / __cxa_finalize (static destructors) and __cxa_guard_*
- * (thread-safe static local init). bionic libc.so provides these on all
- * modern Android, but to be fully self-contained and avoid any dlopen
- * resolution issues in zygote, we provide trivial no-op implementations.
- * Our code never throws, never relies on static destruction, and all guarded
- * statics are initialized with constant values, so these stubs are safe. */
-extern "C" {
-int __cxa_atexit(void (*)(void *), void *, void *) { return 0; }
-void __cxa_finalize(void *) {}
-/* __cxa_guard_acquire: return 0 = already initialized, no call needed */
-unsigned __cxa_guard_acquire(unsigned *g) { (void)g; return 0; }
-void __cxa_guard_release(unsigned *g) { (void)g; }
-void __cxa_guard_abort(unsigned *g) { (void)g; }
-}
