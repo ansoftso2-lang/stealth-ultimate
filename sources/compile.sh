@@ -28,6 +28,8 @@ COMMON_FLAGS=(
     -std=c++17
     -Wall
     -Wextra
+    -nostdlib++
+    -static-libgcc
     -Wl,--hash-style=both
     -Wl,-z,global
     -Wl,-z,now
