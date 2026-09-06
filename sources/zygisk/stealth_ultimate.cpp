@@ -746,3 +746,19 @@ static void su_companion_handler(int /*client*/) {}
 
 REGISTER_ZYGISK_MODULE(StealthModule)
 REGISTER_ZYGISK_COMPANION(su_companion_handler)
+
+/* ── C++ runtime stubs ──
+ * Built with -nostdlib++ (no libc++ linked) to avoid a dependency on
+ * libc++_shared.so, which is unreliable in zygote's isolated linker namespace
+ * when Magisk loads the module via android_dlopen_ext with a library fd.
+ * The compiler emits calls to __cxa_guard_* (thread-safe static local init)
+ * and __cxa_atexit/__cxa_finalize (static destructors). We provide no-op
+ * implementations: our guarded statics use constant initializers (the guard
+ * is skipped in practice), and we never throw so no destructors need to run. */
+extern "C" {
+int      __cxa_atexit(void (*)(void *), void *, void *) { return 0; }
+void     __cxa_finalize(void *) {}
+unsigned __cxa_guard_acquire(unsigned *g) { (void)g; return 1; }
+void     __cxa_guard_release(unsigned *g) { (void)g; }
+void     __cxa_guard_abort(unsigned *g) { (void)g; }
+}

@@ -30,15 +30,16 @@ COMMON_FLAGS=(
     -fPIC
     -shared
     -std=c++17
+    -fno-exceptions
+    -fno-rtti
     -Wall
     -Wextra
+    -nostdlib++
     -Wl,--hash-style=both
     -Wl,-z,global
     -Wl,-z,now
     -Wl,-z,noexecstack
-    -Wl,-u,zygisk_module_entry
-    -Wl,-u,zygisk_companion_entry
-    -Wl,--export-dynamic
+    -Wl,--no-undefined
 )
 LIBS=(-lc -ldl -llog)
 
