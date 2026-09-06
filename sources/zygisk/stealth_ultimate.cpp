@@ -777,29 +777,41 @@ static char *get_process_name(void) {
 
 class StealthModule : public zygisk::ModuleBase {
     zygisk::Api *api = nullptr;
+    JNIEnv *env = nullptr;
 public:
-    void onLoad(zygisk::Api *a, JNIEnv *) override {
-        api = a; g_api = a;
+    void onLoad(zygisk::Api *a, JNIEnv *e) override {
+        api = a; g_api = a; env = e;
         init_real_symbols();
         LOGI("onLoad: init done");
     }
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
         if (!args) return;
         jint uid = args->uid;
-        char *proc = get_process_name();
-        LOGI("preAppSpecialize: uid=%d proc=%s", uid, proc ? proc : "(null)");
+        /* Get process name from nice_name (JNI) — /proc/self/cmdline is still
+         * "zygote" at this point, so reading it gives wrong results. */
+        char procbuf[256];
+        procbuf[0] = '\0';
+        if (args->nice_name && env) {
+            const char *s = env->GetStringUTFChars(args->nice_name, nullptr);
+            if (s) {
+                strncpy(procbuf, s, sizeof(procbuf) - 1);
+                procbuf[sizeof(procbuf) - 1] = '\0';
+                env->ReleaseStringUTFChars(args->nice_name, s);
+            }
+        }
+        const char *proc = procbuf[0] ? procbuf : "unknown";
+        LOGI("preAppSpecialize: uid=%d proc=%s", uid, proc);
         if (!process_needs_hidden(uid, proc)) {
-            LOGI("exempt uid=%d — no hooks", uid);
-            free(proc); return;
+            LOGI("exempt uid=%d proc=%s — no hooks", uid, proc);
+            return;
         }
         g_hidden = true;
-        free(proc);
         api->setOption(zygisk::Option::FORCE_DENYLIST_UNMOUNT);
         g_objects = g_registrations = 0;
         dl_iterate_phdr(phdr_cb, nullptr);
         bool ok = api->pltHookCommit();
-        LOGI("install: commit=%d objects=%d regs=%d", (int)ok, g_objects, g_registrations);
-        if (!ok) LOGE("pltHookCommit FAILED!");
+        LOGI("install: commit=%d objects=%d regs=%d proc=%s", (int)ok, g_objects, g_registrations, proc);
+        if (!ok) LOGE("pltHookCommit FAILED for proc=%s!", proc);
         LOGI("real_openat=%p real_read=%p real_prop_get=%p real_fopen=%p",
              (void*)real_openat, (void*)real_read, (void*)real_prop_get, (void*)real_fopen);
     }
