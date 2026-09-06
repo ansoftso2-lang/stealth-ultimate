@@ -114,8 +114,8 @@ static bool is_hidden_path(const char *path) {
     if (!path || !*path) return false;
     if (su_strstr(path, "/data/local/tmp/")) {
         static const char *const kTmp[] = {
-            "magisk","frida","re.frida","gum","linjector","busybox",
-            "su","stealth","riru","xposed","lspd","magiskboot","resetprop", nullptr
+            "/magisk","/frida","/re.frida","/gum","/linjector","/busybox",
+            "/su","/stealth","/riru","/xposed","/lspd","/magiskboot","/resetprop", nullptr
         };
         for (size_t i = 0; kTmp[i]; ++i) if (su_strstr(path, kTmp[i])) return true;
         return false;
@@ -169,7 +169,7 @@ static bool is_hidden_name(const char *name) {
         "lspd","riru","xposed","lsposed","shamiko","substrate",
         "frida","frida-server","su",".su","busybox",
         "resetprop","su_stealth","stealth","stealth_ultimate",
-        "sepolicy","supolicy","adb", nullptr
+        "sepolicy","supolicy", nullptr
     };
     for (size_t i = 0; kHN[i]; ++i) {
         const char *h = kHN[i]; size_t len = strlen(h);
@@ -974,10 +974,6 @@ static bool is_root_management_app(const char *proc) {
     return false;
 }
 
-/* Forward declarations for companion-based root UID check */
-static void load_root_uids_via_companion(zygisk::Api *api);
-static bool uid_has_root(int uid);
-
 static bool process_needs_hidden(int uid, const char *proc) {
     if (uid == 0 || uid == 1000) return false;
     if (!proc || !*proc) return true;
@@ -1045,12 +1041,6 @@ public:
             LOGI("skip (root granted) proc=%s", proc);
             return;
         }
-        /* Also check via companion process (reads MagiskSU policies as root) */
-        load_root_uids_via_companion(api);
-        if (uid_has_root(uid)) {
-            LOGI("skip (root uid via companion) uid=%d proc=%s", uid, proc);
-            return;
-        }
         if (!process_needs_hidden(uid, proc)) {
             LOGI("exempt uid=%d proc=%s — no hooks", uid, proc);
             return;
@@ -1088,99 +1078,9 @@ public:
     void postServerSpecialize(const zygisk::ServerSpecializeArgs *) override {}
 };
 
-/* ── Companion process: runs as root, reads MagiskSU policies ──
- * Communicates with module via socket. Module sends target UID,
- * companion responds with 1 (has root) or 0 (no root). */
-static bool g_root_uids_loaded = false;
-static int g_root_uids[256];
-static int g_root_uid_count = 0;
-
-static void load_root_uids_via_companion(zygisk::Api *api) {
-    if (g_root_uids_loaded) return;
-    g_root_uids_loaded = true;
-    int fd = api->connectCompanion();
-    if (fd < 0) { LOGI("companion: connect failed"); return; }
-    /* Request: send magic 'L' (load root UIDs) */
-    char cmd = 'L';
-    if (write(fd, &cmd, 1) != 1) { close(fd); return; }
-    /* Response: read count then UIDs */
-    int count = 0;
-    if (read(fd, &count, sizeof(count)) != sizeof(count)) { close(fd); return; }
-    if (count > 256) count = 256;
-    if (count > 0) {
-        if (read(fd, g_root_uids, count * sizeof(int)) != (ssize_t)(count * sizeof(int))) {
-            close(fd); return;
-        }
-    }
-    g_root_uid_count = count;
-    close(fd);
-    LOGI("companion: loaded %d root UIDs", count);
-}
-
-static bool uid_has_root(int uid) {
-    for (int i = 0; i < g_root_uid_count; ++i) {
-        if (g_root_uids[i] == uid) return true;
-    }
-    return false;
-}
-
-/* Companion handler: runs in root process, reads MagiskSU policies */
-static void su_companion_handler(int client) {
-    /* Read command */
-    char cmd = 0;
-    if (read(client, &cmd, 1) != 1) { close(client); return; }
-    if (cmd == 'L') {
-        /* Load root UIDs from MagiskSU policies */
-        int uids[256];
-        int count = 0;
-        /* Try magisk --sqlite first */
-        FILE *fp = popen("magisk --sqlite \"SELECT uid FROM policies WHERE policy=2\" 2>/dev/null", "r");
-        if (fp) {
-            char line[64];
-            while (count < 256 && fgets(line, sizeof(line), fp)) {
-                int u = 0;
-                char *p = line;
-                while (*p && (*p < '0' || *p > '9')) p++;
-                while (*p >= '0' && *p <= '9') { u = u * 10 + (*p - '0'); p++; }
-                if (u > 0) uids[count++] = u;
-            }
-            pclose(fp);
-        }
-        /* Fallback: try ksud/apd */
-        if (count == 0) {
-            fp = popen("ksud sqlite \"SELECT uid FROM root_config WHERE policy=2\" 2>/dev/null", "r");
-            if (fp) {
-                char line[64];
-                while (count < 256 && fgets(line, sizeof(line), fp)) {
-                    int u = 0;
-                    char *p = line;
-                    while (*p && (*p < '0' || *p > '9')) p++;
-                    while (*p >= '0' && *p <= '9') { u = u * 10 + (*p - '0'); p++; }
-                    if (u > 0) uids[count++] = u;
-                }
-                pclose(fp);
-            }
-        }
-        if (count == 0) {
-            fp = popen("apd sqlite \"SELECT uid FROM root_config WHERE policy=2\" 2>/dev/null", "r");
-            if (fp) {
-                char line[64];
-                while (count < 256 && fgets(line, sizeof(line), fp)) {
-                    int u = 0;
-                    char *p = line;
-                    while (*p && (*p < '0' || *p > '9')) p++;
-                    while (*p >= '0' && *p <= '9') { u = u * 10 + (*p - '0'); p++; }
-                    if (u > 0) uids[count++] = u;
-                }
-                pclose(fp);
-            }
-        }
-        /* Send response */
-        write(client, &count, sizeof(count));
-        if (count > 0) write(client, uids, count * sizeof(int));
-    }
-    close(client);
-}
+/* Companion handler — empty (no IPC needed). Root detection is handled
+ * via PROCESS_GRANTED_ROOT flag and package-name exempt list. */
+static void su_companion_handler(int) {}
 
 REGISTER_ZYGISK_MODULE(StealthModule)
 REGISTER_ZYGISK_COMPANION(su_companion_handler)
