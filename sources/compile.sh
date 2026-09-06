@@ -36,11 +36,11 @@ echo "Building with: $NDK_BUILD"
     APP_STL=none \
     V=1
 
-# ndk-build outputs to <BUILD>/local/<abi>/libstealth.so
+# ndk-build outputs to <BUILD>/libs/<abi>/libstealth.so
 ABIS=(arm64-v8a armeabi-v7a x86 x86_64)
 rm -f "$OUT_DIR"/*.so
 for abi in "${ABIS[@]}"; do
-    src="$BUILD_DIR/local/$abi/libstealth.so"
+    src="$BUILD_DIR/libs/$abi/libstealth.so"
     if [[ ! -s "$src" ]]; then
         echo "Missing or empty build output: $src" >&2
         exit 1
