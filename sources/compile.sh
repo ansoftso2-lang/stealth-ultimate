@@ -47,8 +47,6 @@ COMMON_CXXFLAGS=(
     -std=c++17
     -fno-exceptions
     -fno-rtti
-    -fvisibility=hidden
-    -fvisibility-inlines-hidden
     -Wall
     -Wextra
 )
@@ -81,7 +79,7 @@ compile_arch() {
         "${COMMON_CXXFLAGS[@]}" \
         --sysroot "$SYSROOT" \
         -o "$output" "$SRC" \
-        "$libcxx" \
+        -Wl,-Bstatic "$libcxx" -Wl,-Bdynamic \
         "${COMMON_LDFLAGS[@]}" \
         -lc -ldl -llog -latomic
 
