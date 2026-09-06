@@ -467,10 +467,106 @@ static const char *spoof_value_for(const char *key) {
     return nullptr;
 }
 
+/* ── memfd_create based proc file substitution ──
+ * Instead of filtering read() (which detectors bypass via sendfile/mmap),
+ * we intercept openat() and return a memfd with pre-filtered content.
+ * This defeats ALL read methods: read, pread64, sendfile, mmap. */
+static int create_filtered_memfd(const char *path) {
+    if (!path || !g_hidden) return -1;
+    /* Only intercept these proc files */
+    bool is_maps = su_streq(path, "/proc/self/maps") || (su_starts(path, "/proc/") && su_strstr(path, "/maps"));
+    bool is_mountinfo = su_streq(path, "/proc/self/mountinfo") || su_streq(path, "/proc/self/mounts") ||
+                        su_streq(path, "/proc/self/mountstats") ||
+                        (su_starts(path, "/proc/") && su_strstr(path, "/mounts"));
+    bool is_environ = su_streq(path, "/proc/self/environ") ||
+                      (su_starts(path, "/proc/") && su_strstr(path, "/environ"));
+    bool is_status = su_streq(path, "/proc/self/status") ||
+                     (su_starts(path, "/proc/") && su_strstr(path, "/status"));
+    bool is_cmdline = su_streq(path, "/proc/cmdline");
+    if (!is_maps && !is_mountinfo && !is_environ && !is_status && !is_cmdline) return -1;
+
+    /* Read the real file content */
+    int real_fd = real_openat ? real_openat(AT_FDCWD, path, O_RDONLY, 0) : -1;
+    if (real_fd < 0) return -1;
+
+    /* Read entire content into a buffer */
+    char *buf = (char*)malloc(1024 * 256);  /* 256KB max */
+    if (!buf) { close(real_fd); return -1; }
+    size_t total = 0;
+    ssize_t n;
+    while (total < 1024 * 256 - 1 &&
+           (n = real_read ? real_read(real_fd, buf + total, 1024 * 256 - 1 - total) : -1) > 0) {
+        total += (size_t)n;
+    }
+    close(real_fd);
+    buf[total] = '\0';
+
+    /* Filter content based on file type */
+    if (is_maps || is_mountinfo) {
+        /* Line-based filtering for maps and mountinfo */
+        size_t w = 0;
+        char *line_start = buf;
+        while (line_start < buf + total) {
+            char *nl = (char*)memchr(line_start, '\n', buf + total - line_start);
+            size_t line_len = nl ? (size_t)(nl - line_start + 1) : (buf + total - line_start);
+            char tmp[1024];
+            size_t copy = line_len < sizeof(tmp) - 1 ? line_len : sizeof(tmp) - 1;
+            memcpy(tmp, line_start, copy);
+            tmp[copy] = '\0';
+            bool hide = should_hide_maps_line(tmp) || should_hide_mounts_line(tmp);
+            if (!hide) {
+                memmove(buf + w, line_start, line_len);
+                w += line_len;
+            }
+            if (nl) line_start = nl + 1; else break;
+        }
+        total = w;
+    } else if (is_environ) {
+        /* NUL-separated environ entries */
+        size_t w = 0;
+        size_t i = 0;
+        while (i < total) {
+            size_t end = i;
+            while (end < total && buf[end] != '\0') end++;
+            size_t entry_len = (end < total) ? (end - i + 1) : (end - i);
+            if (!should_hide_environ_entry(buf + i)) {
+                memmove(buf + w, buf + i, entry_len);
+                w += entry_len;
+            }
+            if (end < total) i = end + 1; else break;
+        }
+        total = w;
+    } else if (is_status) {
+        /* Patch TracerPid */
+        patch_tracerpid(buf, total);
+    } else if (is_cmdline) {
+        /* Patch boot cmdline */
+        patch_cmdline(buf, total);
+    }
+
+    /* Create memfd and write filtered content */
+    int memfd = syscall(SYS_memfd_create, "proc", 0);
+    if (memfd < 0) { free(buf); return -1; }
+    if (total > 0) {
+        ssize_t written = 0;
+        while ((size_t)written < total) {
+            ssize_t w = write(memfd, buf + written, total - written);
+            if (w <= 0) break;
+            written += w;
+        }
+    }
+    lseek(memfd, 0, SEEK_SET);
+    free(buf);
+    return memfd;
+}
+
 /* ── Hook functions ── */
 
 static int my_openat(int fd, const char *path, int flags, ...) {
     if (is_hidden_path(path)) { errno = ENOENT; return -1; }
+    /* Try memfd substitution for proc files */
+    int memfd = create_filtered_memfd(path);
+    if (memfd >= 0) return memfd;
     mode_t mode = 0;
     if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = (int)va_arg(ap, int); va_end(ap); }
     return real_openat ? real_openat(fd, path, flags, mode) : -1;
