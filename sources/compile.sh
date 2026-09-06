@@ -48,6 +48,8 @@ COMMON_CXXFLAGS=(
     -fno-exceptions
     -fno-rtti
     -nostdlib++
+    -fno-function-sections
+    -fno-data-sections
     -Wall
     -Wextra
 )
