@@ -86,6 +86,10 @@ static int            (*real_getdents)(unsigned int, struct dirent *, unsigned i
 static int            (*real_openat2)(int, const char *, struct open_how *, size_t) = nullptr;
 static int            (*real_dl_iterate_phdr)(int (*)(struct dl_phdr_info *, size_t, void *), void *) = nullptr;
 static void           *(*real_mmap)(void *, size_t, int, int, int, off_t)           = nullptr;
+static int            (*real_execve)(const char *, char *const[], char *const[])     = nullptr;
+static int            (*real_execv)(const char *, char *const[])                     = nullptr;
+static int            (*real_access_exec)(const char *, int)                        = nullptr;
+static int            (*real_xstat)(int, const char *, struct stat *)              = nullptr;
 
 /* dl_iterate_phdr interceptor state */
 static int (*g_user_phdr_cb)(struct dl_phdr_info *, size_t, void *) = nullptr;
@@ -124,10 +128,24 @@ static bool is_hidden_path(const char *path) {
         "de.robv.android.xposed","org.lsposed",
         "frida","re.frida.server","gum-js-loop","linjector",
         "/system/bin/su","/system/xbin/su","/vendor/bin/su",
+        "/sbin/su","/system/su","/system/bin/.ext/.su",
+        "/system/usr/we-need-root/su-backup","/system/xbin/mu",
+        "/data/local/su","/data/local/bin/su","/data/local/xbin/su",
         "superuser","supersu","/system/app/Superuser",
         "busybox","resetprop","sepolicy","supolicy",
         "/sys/fs/selinux/enforce","/sys/fs/selinux/booleans",
+        "/sys/fs/selinux/attr/current","/sys/fs/selinux/attr/exec",
+        "/sys/fs/selinux/attr/fscreate","/sys/fs/selinux/attr/keycreate",
+        "/sys/fs/selinux/attr/sockcreate","/sys/fs/selinux/attr/prev",
+        "/sys/fs/selinux/context","/sys/fs/selinux/access",
+        "/sys/fs/selinux/create","/sys/fs/selinux/member",
         "su_stealth","stealth_ultimate","/cache/stealth_ultimate",
+        "noshufou.android.su","thirdparty.superuser","chainfire.supersu",
+        "koushikdutta.superuser","zachspong.temprootremovejb",
+        "ramdroid.appquarantine","cyanogenmod.superuser",
+        "com.noshufou.android.su","com.thirdparty.superuser",
+        "eu.chainfire.supersu","com.koushikdutta.superuser",
+        "com.zachspong.temprootremovejb","com.ramdroid.appquarantine",
         nullptr
     };
     for (size_t i = 0; kHidden[i]; ++i) if (su_strstr(path, kHidden[i])) return true;
@@ -182,7 +200,11 @@ static bool should_hide_mounts_line(const char *line) {
         "magisk","ksu","apatch","lspd","riru","xposed","frida",
         "shamiko","substrate","su_stealth","stealth",
         "/data/adb","/sbin/.magisk","/debug_ramdisk","zygisk",
-        "tmpfs /sbin","overlay","/dev/block/loop", nullptr
+        "tmpfs /sbin","overlay","/dev/block/loop",
+        "bind","errors=continue","errors=remount-ro",
+        "tmpfs /data/adb","tmpfs /debug_ramdisk",
+        "shared","master","propagate","unbindable",
+        nullptr
     };
     for (size_t i = 0; kP[i]; ++i) if (su_strstr(line, kP[i])) return true;
     return false;
@@ -758,13 +780,23 @@ static int my_dl_iterate_phdr(int (*cb)(struct dl_phdr_info *, size_t, void *), 
  * Most detectors use open+read on maps, not mmap on mem. */
 static void *my_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
     if (fd >= 0 && (prot & PROT_READ)) {
-        /* Check if fd points to a filterable proc file */
         int kind = fd_filter_kind(fd);
         if (kind == 1 || kind == 2 || kind == 3 || kind == 4) {
             /* Let it map — the read hook handles content filtering */
         }
     }
     return real_mmap ? real_mmap(addr, length, prot, flags, fd, offset) : MAP_FAILED;
+}
+
+/* Block execve/execv of hidden binaries (su, magisk, busybox) */
+static int my_execve(const char *path, char *const argv[], char *const envp[]) {
+    if (is_hidden_path(path)) { errno = ENOENT; return -1; }
+    return real_execve ? real_execve(path, argv, envp) : -1;
+}
+
+static int my_execv(const char *path, char *const argv[]) {
+    if (is_hidden_path(path)) { errno = ENOENT; return -1; }
+    return real_execv ? real_execv(path, argv) : -1;
 }
 
 /* ── Hook registration ── */
@@ -806,6 +838,8 @@ static void register_hooks_for_object(dev_t dev, ino_t ino) {
         {"openat2",                      (void*)my_openat2,        (void**)&real_openat2},
         {"dl_iterate_phdr",              (void*)my_dl_iterate_phdr,(void**)&real_dl_iterate_phdr},
         {"mmap",                         (void*)my_mmap,           (void**)&real_mmap},
+        {"execve",                       (void*)my_execve,         (void**)&real_execve},
+        {"execv",                        (void*)my_execv,          (void**)&real_execv},
     };
     for (size_t i = 0; i < sizeof(hooks)/sizeof(hooks[0]); ++i) {
         g_api->pltHookRegister(dev, ino, hooks[i].name, hooks[i].impl, hooks[i].backup);
@@ -862,6 +896,8 @@ static void init_real_symbols(void) {
     real_openat2    = (decltype(real_openat2))dlsym(RTLD_NEXT, "openat2");
     real_dl_iterate_phdr = (decltype(real_dl_iterate_phdr))dlsym(RTLD_NEXT, "dl_iterate_phdr");
     real_mmap       = (decltype(real_mmap))dlsym(RTLD_NEXT, "mmap");
+    real_execve     = (decltype(real_execve))dlsym(RTLD_NEXT, "execve");
+    real_execv      = (decltype(real_execv))dlsym(RTLD_NEXT, "execv");
 }
 
 /* ── JNI SystemProperties hooks ──
