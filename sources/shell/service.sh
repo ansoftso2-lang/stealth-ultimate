@@ -1,8 +1,7 @@
 ﻿#!/system/bin/sh
-# service.sh v2.2 — Optional post-boot: refresh root UID list.
-MODDIR=${0%/*}
-DATA_DIR="/data/adb/stealth_ultimate"
-LOG="$DATA_DIR/stealth.log"
+# service.sh v3.0 — Post-boot: refresh root-UID list across frameworks.
+DATA_DIR="/data/adb/su_stealth"
+LOG="$DATA_DIR/svc.log"
 
 mkdir -p "$DATA_DIR" 2>/dev/null
 
@@ -19,7 +18,6 @@ if command -v magisk >/dev/null 2>&1; then
     [ -z "$ROOT_UIDS" ] && ROOT_UIDS=$(magisk --sqlite "SELECT uid FROM uids WHERE policy=2" 2>/dev/null | grep -oE '[0-9]+$' | tr '\n' ' ')
 elif [ -f /data/adb/magisk.db ] && command -v sqlite3 >/dev/null 2>&1; then
     ROOT_UIDS=$(sqlite3 /data/adb/magisk.db "SELECT uid FROM policies WHERE policy=2" 2>/dev/null | tr '\n' ' ')
-    [ -z "$ROOT_UIDS" ] && ROOT_UIDS=$(sqlite3 /data/adb/magisk.db "SELECT uid FROM uids WHERE policy=2" 2>/dev/null | tr '\n' ' ')
 elif command -v ksud >/dev/null 2>&1; then
     ROOT_UIDS=$(ksud sqlite "SELECT uid FROM root_config WHERE policy=2" 2>/dev/null | grep -oE '[0-9]+$' | tr '\n' ' ')
 elif command -v apd >/dev/null 2>&1; then
@@ -29,9 +27,8 @@ fi
 if [ -n "$ROOT_UIDS" ]; then
     echo "$ROOT_UIDS" > "$DATA_DIR/root_uids.txt" 2>/dev/null
     chmod 644 "$DATA_DIR/root_uids.txt" 2>/dev/null
-    log "Root UIDs: $ROOT_UIDS"
+    log "Root UIDs refreshed"
 else
     log "No root UIDs found"
 fi
-
 log "=== service.sh END ==="
