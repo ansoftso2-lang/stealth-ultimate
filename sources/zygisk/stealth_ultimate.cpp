@@ -88,8 +88,6 @@ static int            (*real_dl_iterate_phdr)(int (*)(struct dl_phdr_info *, siz
 static void           *(*real_mmap)(void *, size_t, int, int, int, off_t)           = nullptr;
 static int            (*real_execve)(const char *, char *const[], char *const[])     = nullptr;
 static int            (*real_execv)(const char *, char *const[])                     = nullptr;
-static int            (*real_access_exec)(const char *, int)                        = nullptr;
-static int            (*real_xstat)(int, const char *, struct stat *)              = nullptr;
 
 /* dl_iterate_phdr interceptor state */
 static int (*g_user_phdr_cb)(struct dl_phdr_info *, size_t, void *) = nullptr;
@@ -853,7 +851,17 @@ static int phdr_cb(struct dl_phdr_info *info, size_t, void *) {
     if (su_strstr(info->dlpi_name, "su_stealth") ||
         su_strstr(info->dlpi_name, "stealth_ultimate")) return 0;
     struct stat st;
-    if (stat(info->dlpi_name, &st) != 0) return 0;
+    /* Use real_stat (dlsym) first; fallback to stat then fstatat.
+     * On arm64 Android 11+, stat() may be inlined to fstatat and not a PLT
+     * symbol, so the direct call can fail. Try multiple methods. */
+    int r = -1;
+    if (real_stat) r = real_stat(info->dlpi_name, &st);
+    if (r != 0) r = stat(info->dlpi_name, &st);
+    if (r != 0) r = real_fstatat ? real_fstatat(AT_FDCWD, info->dlpi_name, &st, 0) : -1;
+    if (r != 0) {
+        LOGE("phdr: stat failed for %s", info->dlpi_name);
+        return 0;
+    }
     if (st.st_dev == 0 || st.st_ino == 0) return 0;
     LOGI("phdr: %s dev=%lu ino=%lu", info->dlpi_name, (unsigned long)st.st_dev, (unsigned long)st.st_ino);
     register_hooks_for_object(st.st_dev, st.st_ino);
