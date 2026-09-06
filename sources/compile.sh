@@ -31,6 +31,7 @@ echo "Building with: $NDK_BUILD"
     NDK_PROJECT_PATH="$BUILD_DIR" \
     APP_BUILD_SCRIPT="$JNIDIR/Android.mk" \
     NDK_APPLICATION_MK="$JNIDIR/Application.mk" \
+    APP_STL=c++_static \
     V=1
 
 # ndk-build outputs to <BUILD>/libs/<abi>/libstealth.so
