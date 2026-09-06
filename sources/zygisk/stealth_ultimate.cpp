@@ -32,6 +32,7 @@
 #include <sys/vfs.h>
 #include <sys/statvfs.h>
 #include <mntent.h>
+#include <sys/utsname.h>
 
 #include "zygisk.hpp"
 
@@ -79,6 +80,9 @@ static int            (*real_statvfs)(const char *, struct statvfs *)           
 static FILE           *(*real_setmntent)(const char *, const char *)              = nullptr;
 static struct mntent  *(*real_getmntent)(FILE *)                                 = nullptr;
 static void           *(*real_dlopen)(const char *, int)                          = nullptr;
+static int            (*real_getdents64)(unsigned int, struct dirent *, unsigned int) = nullptr;
+static int            (*real_getdents)(unsigned int, struct dirent *, unsigned int) = nullptr;
+static int            (*real_openat2)(int, const char *, struct open_how *, size_t) = nullptr;
 
 /* ── Module global state ── */
 static zygisk::Api *g_api = nullptr;
@@ -370,6 +374,14 @@ static const char *spoof_value_for(const char *key) {
         {"ro.boot.vbmeta.device_state", "locked"},
         {"ro.boot.warranty_bit", "0"},
         {"ro.warranty_bit", "0"},
+        {"ro.boot.oem_unlock_supported", "0"},
+        {"ro.oem_unlock_supported", "0"},
+        {"ro.boot.vbmeta.hash_alg", "sha256"},
+        {"ro.boot.vbmeta.size", "0x1000"},
+        {"ro.boot.vbmeta.digest", "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"},
+        {"ro.boot.keymaster", "1"},
+        {"ro.boot.veritymode", "enforcing"},
+        {"ro.boot.verifiedbootstate", "green"},
         {"ro.debuggable", "0"},
         {"ro.secure", "1"},
         {"ro.bootmode", "normal"},
@@ -658,6 +670,52 @@ static void *my_dlopen(const char *filename, int flags) {
     return real_dlopen ? real_dlopen(filename, flags) : nullptr;
 }
 
+/* getdents64: filter hidden entries from directory listings.
+ * Detectors bypass readdir() and call getdents64 directly via syscall. */
+static int my_getdents64(unsigned int fd, struct dirent *dirp, unsigned int count) {
+    int n = real_getdents64 ? real_getdents64(fd, dirp, count) : -1;
+    if (n <= 0) return n;
+    /* Compact the buffer, removing hidden entries */
+    int w = 0;
+    int i = 0;
+    while (i < n) {
+        struct dirent *de = (struct dirent*)((char*)dirp + i);
+        if (!is_hidden_name(de->d_name)) {
+            if (w != i) {
+                memmove((char*)dirp + w, (char*)dirp + i, de->d_reclen);
+            }
+            w += de->d_reclen;
+        }
+        i += de->d_reclen;
+    }
+    return w;
+}
+
+static int my_getdents(unsigned int fd, struct dirent *dirp, unsigned int count) {
+    int n = real_getdents ? real_getdents(fd, dirp, count) : -1;
+    if (n <= 0) return n;
+    int w = 0;
+    int i = 0;
+    while (i < n) {
+        struct dirent *de = (struct dirent*)((char*)dirp + i);
+        if (!is_hidden_name(de->d_name)) {
+            if (w != i) {
+                memmove((char*)dirp + w, (char*)dirp + i, de->d_reclen);
+            }
+            w += de->d_reclen;
+        }
+        i += de->d_reclen;
+    }
+    return w;
+}
+
+/* openat2: newer syscall replacing openat (Android 11+) */
+struct open_how;
+static int my_openat2(int dfd, const char *path, struct open_how *how, size_t sz) {
+    if (is_hidden_path(path)) { errno = ENOENT; return -1; }
+    return real_openat2 ? real_openat2(dfd, path, how, sz) : -1;
+}
+
 /* ── Hook registration ── */
 static void register_hooks_for_object(dev_t dev, ino_t ino) {
     struct { const char *name; void *impl; void **backup; } hooks[] = {
@@ -692,6 +750,9 @@ static void register_hooks_for_object(dev_t dev, ino_t ino) {
         {"setmntent",                    (void*)my_setmntent,     (void**)&real_setmntent},
         {"getmntent",                    (void*)my_getmntent,     (void**)&real_getmntent},
         {"dlopen",                       (void*)my_dlopen,         (void**)&real_dlopen},
+        {"getdents64",                   (void*)my_getdents64,     (void**)&real_getdents64},
+        {"getdents",                     (void*)my_getdents,       (void**)&real_getdents},
+        {"openat2",                      (void*)my_openat2,        (void**)&real_openat2},
     };
     for (size_t i = 0; i < sizeof(hooks)/sizeof(hooks[0]); ++i) {
         g_api->pltHookRegister(dev, ino, hooks[i].name, hooks[i].impl, hooks[i].backup);
@@ -743,6 +804,9 @@ static void init_real_symbols(void) {
     real_setmntent  = (decltype(real_setmntent))dlsym(RTLD_NEXT, "setmntent");
     real_getmntent  = (decltype(real_getmntent))dlsym(RTLD_NEXT, "getmntent");
     real_dlopen     = (decltype(real_dlopen))dlsym(RTLD_NEXT, "dlopen");
+    real_getdents64 = (decltype(real_getdents64))dlsym(RTLD_NEXT, "getdents64");
+    real_getdents   = (decltype(real_getdents))dlsym(RTLD_NEXT, "getdents");
+    real_openat2    = (decltype(real_openat2))dlsym(RTLD_NEXT, "openat2");
 }
 
 /* ── JNI SystemProperties hooks ──
