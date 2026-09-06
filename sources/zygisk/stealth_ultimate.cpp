@@ -761,3 +761,18 @@ static void su_companion_handler(int /*client*/) {}
 
 REGISTER_ZYGISK_MODULE(StealthModule)
 REGISTER_ZYGISK_COMPANION(su_companion_handler)
+
+/* ── C++ runtime stubs ──
+ * No libc++ is linked (-fno-exceptions -fno-rtti, no libc++_static.a).
+ * The compiler still emits calls to __cxa_guard_* (thread-safe static local
+ * init) and __cxa_atexit/__cxa_finalize (static destructors). We provide
+ * trivial no-op implementations so the link succeeds with --no-undefined.
+ * Our guarded statics are initialized with constant values, so skipping the
+ * guard is safe; we never throw, so no destructors need to run. */
+extern "C" {
+int    __cxa_atexit(void (*)(void *), void *, void *) { return 0; }
+void   __cxa_finalize(void *) {}
+unsigned __cxa_guard_acquire(unsigned *g) { (void)g; return 0; }
+void   __cxa_guard_release(unsigned *g) { (void)g; }
+void   __cxa_guard_abort(unsigned *g) { (void)g; }
+}

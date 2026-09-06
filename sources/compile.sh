@@ -56,6 +56,8 @@ COMMON_LDFLAGS=(
     -Wl,-z,now
     -Wl,-z,noexecstack
     -Wl,-soname,libstealth.so
+    -Wl,--no-gc-sections
+    -Wl,--no-undefined
 )
 
 compile_arch() {
@@ -65,21 +67,13 @@ compile_arch() {
     local output="$OUT_DIR/$abi.so"
 
     [[ -x "$compiler" ]] || { echo "Compiler not found: $compiler" >&2; exit 1; }
-
-    local libcxx
-    libcxx="$(libcxx_static_for "$triple")"
-    [[ -n "$libcxx" && -f "$libcxx" ]] || {
-        echo "libc++_static.a not found for $abi (triple=$triple)" >&2
-        exit 1
-    }
-    echo "Compiling $abi with $(basename "$compiler") (libc++_static: $libcxx)..."
+    echo "Compiling $abi with $(basename "$compiler")..."
 
     "$compiler" \
         "${INCLUDE_FLAGS[@]}" \
         "${COMMON_CXXFLAGS[@]}" \
         --sysroot "$SYSROOT" \
         -o "$output" "$SRC" \
-        -Wl,-Bstatic "$libcxx" -Wl,-Bdynamic \
         "${COMMON_LDFLAGS[@]}" \
         -lc -ldl -llog -latomic
 
