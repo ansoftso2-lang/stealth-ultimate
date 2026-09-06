@@ -198,10 +198,9 @@ static bool should_hide_mounts_line(const char *line) {
         "magisk","ksu","apatch","lspd","riru","xposed","frida",
         "shamiko","substrate","su_stealth","stealth",
         "/data/adb","/sbin/.magisk","/debug_ramdisk","zygisk",
-        "tmpfs /sbin","overlay","/dev/block/loop",
-        "bind","errors=continue","errors=remount-ro",
+        "tmpfs /sbin","/dev/block/loop",
+        "errors=continue","errors=remount-ro",
         "tmpfs /data/adb","tmpfs /debug_ramdisk",
-        "shared","master","propagate","unbindable",
         nullptr
     };
     for (size_t i = 0; kP[i]; ++i) if (su_strstr(line, kP[i])) return true;
@@ -334,29 +333,59 @@ static void patch_cmdline(char *buf, size_t len) {
 /* Decide whether the contents read from `fd` should be filtered.
  * Returns: 0=no filtering, 1=filter lines, 2=patch TracerPid,
  *          3=filter environ, 4=filter cmdline/proc/cmdline */
+
+/* Simple fd→filter-kind cache to avoid readlink on every read() call. */
+#define SU_FD_CACHE_SIZE 64
+static struct { int fd; int kind; } g_fd_cache[SU_FD_CACHE_SIZE];
+static int g_fd_cache_next = 0;
+
+static void fd_cache_set(int fd, int kind) {
+    for (int i = 0; i < SU_FD_CACHE_SIZE; ++i) {
+        if (g_fd_cache[i].fd == fd) { g_fd_cache[i].kind = kind; return; }
+    }
+    g_fd_cache[g_fd_cache_next].fd = fd;
+    g_fd_cache[g_fd_cache_next].kind = kind;
+    g_fd_cache_next = (g_fd_cache_next + 1) % SU_FD_CACHE_SIZE;
+}
+
+static int fd_cache_get(int fd) {
+    for (int i = 0; i < SU_FD_CACHE_SIZE; ++i) {
+        if (g_fd_cache[i].fd == fd) return g_fd_cache[i].kind;
+    }
+    return -1;
+}
+
 static int fd_filter_kind(int fd) {
+    int cached = fd_cache_get(fd);
+    if (cached >= 0) return cached;
     char fdpath[64];
     char link[PATH_MAX];
     snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", fd);
     ssize_t n = real_readlink ? real_readlink(fdpath, link, sizeof(link) - 1) : -1;
-    if (n <= 0) return 0;
+    if (n <= 0) { fd_cache_set(fd, 0); return 0; }
     link[n] = '\0';
-    if (su_streq(link, "/proc/self/status")) return 2;
-    if (su_streq(link, "/proc/self/environ")) return 3;
-    if (su_streq(link, "/proc/self/cmdline")) return 0;
-    if (su_streq(link, "/proc/cmdline")) return 4;
-    if (su_starts(link, "/proc/") && su_strstr(link, "/cmdline")) return 4;
-    static const char *const kFilter[] = {
-        "/proc/self/maps","/proc/self/mounts","/proc/self/mountinfo",
-        "/proc/self/mountstats","/proc/net/unix","/proc/net/tcp",
-        "/proc/net/tcp6","/proc/self/auxv", nullptr
-    };
-    for (size_t i = 0; kFilter[i]; ++i) if (su_starts(link, kFilter[i])) return 1;
-    if (su_starts(link, "/proc/") && su_strstr(link, "/maps")) return 1;
-    if (su_starts(link, "/proc/") && su_strstr(link, "/mounts")) return 1;
-    if (su_starts(link, "/proc/") && su_strstr(link, "/status")) return 2;
-    if (su_starts(link, "/proc/") && su_strstr(link, "/environ")) return 3;
-    return 0;
+    int kind = 0;
+    if (su_streq(link, "/proc/self/status")) kind = 2;
+    else if (su_streq(link, "/proc/self/environ")) kind = 3;
+    else if (su_streq(link, "/proc/self/cmdline")) kind = 0;
+    else if (su_streq(link, "/proc/cmdline")) kind = 4;
+    else if (su_starts(link, "/proc/") && su_strstr(link, "/cmdline")) kind = 4;
+    else {
+        static const char *const kFilter[] = {
+            "/proc/self/maps","/proc/self/mounts","/proc/self/mountinfo",
+            "/proc/self/mountstats","/proc/net/unix","/proc/net/tcp",
+            "/proc/net/tcp6","/proc/self/auxv", nullptr
+        };
+        for (size_t i = 0; kFilter[i]; ++i) if (su_starts(link, kFilter[i])) { kind = 1; break; }
+        if (!kind) {
+            if (su_starts(link, "/proc/") && su_strstr(link, "/maps")) kind = 1;
+            else if (su_starts(link, "/proc/") && su_strstr(link, "/mounts")) kind = 1;
+            else if (su_starts(link, "/proc/") && su_strstr(link, "/status")) kind = 2;
+            else if (su_starts(link, "/proc/") && su_strstr(link, "/environ")) kind = 3;
+        }
+    }
+    fd_cache_set(fd, kind);
+    return kind;
 }
 
 /* ── Property spoofing ── */
