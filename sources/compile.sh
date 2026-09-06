@@ -30,8 +30,6 @@ COMMON_FLAGS=(
     -fPIC
     -shared
     -std=c++17
-    -fno-exceptions
-    -fno-rtti
     -Wall
     -Wextra
     -Wl,--hash-style=both
