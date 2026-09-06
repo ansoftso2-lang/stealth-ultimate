@@ -33,6 +33,8 @@
 #include <sys/statvfs.h>
 #include <sys/mman.h>
 #include <mntent.h>
+#include <sched.h>
+#include <sys/mount.h>
 #include <sys/utsname.h>
 
 #include "zygisk.hpp"
@@ -121,7 +123,16 @@ static bool is_hidden_path(const char *path) {
     /* Hide property files that reveal root manager traces */
     if (su_strstr(path, "/dev/__properties__/") &&
         (su_strstr(path, "magisk") || su_strstr(path, "ksu") || su_strstr(path, "apatch") ||
-         su_strstr(path, "pixelprops") || su_strstr(path, "zygisk"))) {
+         su_strstr(path, "pixelprops") || su_strstr(path, "zygisk") ||
+         su_strstr(path, "u:object_r:magisk") || su_strstr(path, "u:object_r:ksu"))) {
+        return true;
+    }
+    /* Hide /data/app entries for LSPosed/Xposed/root apps */
+    if (su_strstr(path, "/data/app/") &&
+        (su_strstr(path, "lsposed") || su_strstr(path, "xposed") ||
+         su_strstr(path, "lspd") || su_strstr(path, "riru") ||
+         su_strstr(path, "magisk") || su_strstr(path, "supersu") ||
+         su_strstr(path, "superuser"))) {
         return true;
     }
     static const char *const kHidden[] = {
@@ -173,7 +184,10 @@ static bool is_hidden_name(const char *name) {
         "lspd","riru","xposed","lsposed","shamiko","substrate",
         "frida","frida-server","su",".su","busybox",
         "resetprop","su_stealth","stealth","stealth_ultimate",
-        "sepolicy","supolicy", nullptr
+        "sepolicy","supolicy",
+        /* LSPosed/Xposed app package names */
+        "org.lsposed.manager","org.lsposed","de.robv.android.xposed.installer",
+        "de.robv.android.xposed", nullptr
     };
     for (size_t i = 0; kHN[i]; ++i) {
         const char *h = kHN[i]; size_t len = strlen(h);
@@ -1318,7 +1332,17 @@ public:
             LOGE("CRITICAL: 0 objects found — hooks will NOT work! proc=%s", proc);
         }
     }
-    void postAppSpecialize(const zygisk::AppSpecializeArgs *) override {}
+    void postAppSpecialize(const zygisk::AppSpecializeArgs *) override {
+        if (!g_hidden) return;
+        /* Isolate mount namespace to hide mount peer id anomalies.
+         * Create private mount namespace so Magisk mount traces don't leak. */
+        if (unshare(CLONE_NEWNS) == 0) {
+            mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+            LOGI("mount namespace isolated (CLONE_NEWNS + MS_PRIVATE)");
+        } else {
+            LOGE("unshare(CLONE_NEWNS) failed: %s", strerror(errno));
+        }
+    }
     /* Do NOT hook system_server — it breaks mount namespace for all forks
      * and causes root access issues in child processes. */
     void preServerSpecialize(zygisk::ServerSpecializeArgs *) override {}
