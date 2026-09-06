@@ -86,6 +86,8 @@ static int            (*real_getdents)(unsigned int, struct dirent *, unsigned i
 static int            (*real_openat2)(int, const char *, struct open_how *, size_t) = nullptr;
 static int            (*real_dl_iterate_phdr)(int (*)(struct dl_phdr_info *, size_t, void *), void *) = nullptr;
 static void           *(*real_mmap)(void *, size_t, int, int, int, off_t)           = nullptr;
+static int            (*real_android_log_print)(int, const char *, const char *, ...) = nullptr;
+static int            (*real_android_log_write)(int, const char *, const char *)     = nullptr;
 
 /* dl_iterate_phdr interceptor state */
 static int (*g_user_phdr_cb)(struct dl_phdr_info *, size_t, void *) = nullptr;
@@ -115,6 +117,12 @@ static bool is_hidden_path(const char *path) {
         };
         for (size_t i = 0; kTmp[i]; ++i) if (su_strstr(path, kTmp[i])) return true;
         return false;
+    }
+    /* Hide property files that reveal root manager traces */
+    if (su_strstr(path, "/dev/__properties__/") &&
+        (su_strstr(path, "magisk") || su_strstr(path, "ksu") || su_strstr(path, "apatch") ||
+         su_strstr(path, "pixelprops") || su_strstr(path, "zygisk"))) {
+        return true;
     }
     static const char *const kHidden[] = {
         "/data/adb","/sbin/.magisk","/debug_ramdisk",
@@ -584,6 +592,8 @@ static int my_openat(int fd, const char *path, int flags, ...) {
 
 static int my_open(const char *path, int flags, ...) {
     if (is_hidden_path(path)) { errno = ENOENT; return -1; }
+    int memfd = create_filtered_memfd(path);
+    if (memfd >= 0) return memfd;
     mode_t mode = 0;
     if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = (int)va_arg(ap, int); va_end(ap); }
     return real_open ? real_open(path, flags, mode) : -1;
@@ -786,6 +796,17 @@ static void my_prop_read_callback(const prop_info *pi,
 /* ── fopen/opendir/scandir hooks ── */
 static FILE *my_fopen(const char *path, const char *mode) {
     if (is_hidden_path(path)) { errno = ENOENT; return nullptr; }
+    /* Try memfd substitution for proc files */
+    int memfd = create_filtered_memfd(path);
+    if (memfd >= 0) {
+        /* Wrap memfd in FILE* via fdopen */
+        if (real_fopen) {
+            /* fdopen is in libc, use it to wrap our memfd */
+            FILE *fp = fdopen(memfd, mode);
+            if (fp) return fp;
+        }
+        close(memfd);
+    }
     return real_fopen ? real_fopen(path, mode) : nullptr;
 }
 
@@ -932,6 +953,40 @@ static void *my_mmap(void *addr, size_t length, int prot, int flags, int fd, off
  * root access, causing Termux/MT Manager to lose root. File path blocking
  * via openat/access is sufficient for hiding su from detectors. */
 
+/* ── Android log filtering ──
+ * Native Detector checks logcat for Zygisk native bridge error traces.
+ * Filter out any log messages containing Zygisk/native bridge keywords. */
+static int my_android_log_print(int prio, const char *tag, const char *fmt, ...) {
+    if (g_hidden && tag && (su_strstr(tag, "zygisk") || su_strstr(tag, "Zygisk") ||
+        su_strstr(tag, "native.bridge") || su_strstr(tag, "nativebridge"))) {
+        return 0;
+    }
+    if (g_hidden && fmt && (su_strstr(fmt, "native.bridge") || su_strstr(fmt, "zygisk") ||
+        su_strstr(fmt, "Zygisk"))) {
+        return 0;
+    }
+    va_list ap; va_start(ap, fmt);
+    if (real_android_log_print) {
+        int r = real_android_log_print(prio, tag, fmt, ap);
+        va_end(ap);
+        return r;
+    }
+    va_end(ap);
+    return 0;
+}
+
+static int my_android_log_write(int prio, const char *tag, const char *text) {
+    if (g_hidden && tag && (su_strstr(tag, "zygisk") || su_strstr(tag, "Zygisk") ||
+        su_strstr(tag, "native.bridge") || su_strstr(tag, "nativebridge"))) {
+        return 0;
+    }
+    if (g_hidden && text && (su_strstr(text, "native.bridge") || su_strstr(text, "zygisk") ||
+        su_strstr(text, "Zygisk"))) {
+        return 0;
+    }
+    return real_android_log_write ? real_android_log_write(prio, tag, text) : 0;
+}
+
 /* ── Hook registration ── */
 static void register_hooks_for_object(dev_t dev, ino_t ino) {
     struct { const char *name; void *impl; void **backup; } hooks[] = {
@@ -971,6 +1026,8 @@ static void register_hooks_for_object(dev_t dev, ino_t ino) {
         {"openat2",                      (void*)my_openat2,        (void**)&real_openat2},
         {"dl_iterate_phdr",              (void*)my_dl_iterate_phdr,(void**)&real_dl_iterate_phdr},
         {"mmap",                         (void*)my_mmap,           (void**)&real_mmap},
+        {"__android_log_print",          (void*)my_android_log_print, (void**)&real_android_log_print},
+        {"__android_log_write",          (void*)my_android_log_write, (void**)&real_android_log_write},
     };
     for (size_t i = 0; i < sizeof(hooks)/sizeof(hooks[0]); ++i) {
         g_api->pltHookRegister(dev, ino, hooks[i].name, hooks[i].impl, hooks[i].backup);
@@ -1074,6 +1131,8 @@ static void init_real_symbols(void) {
     real_openat2    = (decltype(real_openat2))dlsym(RTLD_NEXT, "openat2");
     real_dl_iterate_phdr = (decltype(real_dl_iterate_phdr))dlsym(RTLD_NEXT, "dl_iterate_phdr");
     real_mmap       = (decltype(real_mmap))dlsym(RTLD_NEXT, "mmap");
+    real_android_log_print = (decltype(real_android_log_print))dlsym(RTLD_NEXT, "__android_log_print");
+    real_android_log_write = (decltype(real_android_log_write))dlsym(RTLD_NEXT, "__android_log_write");
 }
 
 /* ── JNI SystemProperties hooks ──
