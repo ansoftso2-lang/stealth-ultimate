@@ -940,6 +940,17 @@ public:
         }
         const char *proc = procbuf[0] ? procbuf : "unknown";
         LOGI("preAppSpecialize: uid=%d proc=%s", uid, proc);
+
+        /* Check Zygisk flags: PROCESS_GRANTED_ROOT means this process has been
+         * granted root by MagiskSU. Never hook these or su will break. */
+        uint32_t zflags = api->getFlags();
+        bool granted_root = (zflags & zygisk::PROCESS_GRANTED_ROOT) != 0;
+        LOGI("flags: granted_root=%d (flags=0x%x)", (int)granted_root, zflags);
+        if (granted_root) {
+            LOGI("skip (root granted) proc=%s", proc);
+            return;
+        }
+
         if (!process_needs_hidden(uid, proc)) {
             LOGI("exempt uid=%d proc=%s — no hooks", uid, proc);
             return;
