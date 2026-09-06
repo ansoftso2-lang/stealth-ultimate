@@ -35,9 +35,9 @@ cp "$JNIDIR/stealth_ultimate.cpp" "$BUILD_DIR/jni/stealth_ultimate.cpp"
 cp "$JNIDIR/zygisk.hpp"     "$BUILD_DIR/jni/zygisk.hpp"
 
 echo "Building with: $NDK_BUILD"
-"$NDK_BUILD" \
-    NDK_PROJECT_PATH="$BUILD_DIR" \
-    V=1
+# Run ndk-build from within BUILD_DIR so it discovers jni/Application.mk
+# (APP_STL=c++_static) relative to the working directory.
+( cd "$BUILD_DIR" && "$NDK_BUILD" NDK_PROJECT_PATH="$BUILD_DIR" V=1 )
 
 # ndk-build outputs to <BUILD>/libs/<abi>/libstealth.so
 ABIS=(arm64-v8a armeabi-v7a x86 x86_64)
