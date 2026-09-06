@@ -31,6 +31,7 @@
 #include <stdarg.h>
 #include <sys/vfs.h>
 #include <sys/statvfs.h>
+#include <sys/mman.h>
 #include <mntent.h>
 #include <sys/utsname.h>
 
@@ -83,6 +84,12 @@ static void           *(*real_dlopen)(const char *, int)                        
 static int            (*real_getdents64)(unsigned int, struct dirent *, unsigned int) = nullptr;
 static int            (*real_getdents)(unsigned int, struct dirent *, unsigned int) = nullptr;
 static int            (*real_openat2)(int, const char *, struct open_how *, size_t) = nullptr;
+static int            (*real_dl_iterate_phdr)(int (*)(struct dl_phdr_info *, size_t, void *), void *) = nullptr;
+static void           *(*real_mmap)(void *, size_t, int, int, int, off_t)           = nullptr;
+
+/* dl_iterate_phdr interceptor state */
+static int (*g_user_phdr_cb)(struct dl_phdr_info *, size_t, void *) = nullptr;
+static void *g_user_phdr_data = nullptr;
 
 /* ── Module global state ── */
 static zygisk::Api *g_api = nullptr;
@@ -716,6 +723,50 @@ static int my_openat2(int dfd, const char *path, struct open_how *how, size_t sz
     return real_openat2 ? real_openat2(dfd, path, how, sz) : -1;
 }
 
+/* dl_iterate_phdr: filter hidden libraries from enumeration.
+ * Detectors call this directly to bypass /proc/self/maps filtering.
+ * We intercept the callback and skip entries for hidden libraries. */
+static int phdr_filter_cb(struct dl_phdr_info *info, size_t size, void *data) {
+    if (info && info->dlpi_name && *info->dlpi_name) {
+        /* Skip our own module and any hidden library */
+        if (should_hide_maps_line(info->dlpi_name) ||
+            su_strstr(info->dlpi_name, "su_stealth") ||
+            su_strstr(info->dlpi_name, "stealth_ultimate")) {
+            return 0;  /* skip this entry, continue iteration */
+        }
+    }
+    /* Forward to user callback */
+    if (g_user_phdr_cb) return g_user_phdr_cb(info, size, data);
+    return 0;
+}
+
+static int my_dl_iterate_phdr(int (*cb)(struct dl_phdr_info *, size_t, void *), void *data) {
+    if (!g_hidden) {
+        /* Not in hidden mode — pass through (used for hook registration) */
+        return real_dl_iterate_phdr ? real_dl_iterate_phdr(cb, data) : 0;
+    }
+    /* In hidden mode — filter hidden libraries */
+    g_user_phdr_cb = cb;
+    g_user_phdr_data = data;
+    int r = real_dl_iterate_phdr ? real_dl_iterate_phdr(phdr_filter_cb, data) : 0;
+    g_user_phdr_cb = nullptr;
+    return r;
+}
+
+/* mmap: if mapping /proc/self/mem for memory scanning, we can't easily
+ * intercept the read, but we can return failure for hidden fd paths.
+ * Most detectors use open+read on maps, not mmap on mem. */
+static void *my_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
+    if (fd >= 0 && (prot & PROT_READ)) {
+        /* Check if fd points to a filterable proc file */
+        int kind = fd_filter_kind(fd);
+        if (kind == 1 || kind == 2 || kind == 3 || kind == 4) {
+            /* Let it map — the read hook handles content filtering */
+        }
+    }
+    return real_mmap ? real_mmap(addr, length, prot, flags, fd, offset) : MAP_FAILED;
+}
+
 /* ── Hook registration ── */
 static void register_hooks_for_object(dev_t dev, ino_t ino) {
     struct { const char *name; void *impl; void **backup; } hooks[] = {
@@ -753,6 +804,8 @@ static void register_hooks_for_object(dev_t dev, ino_t ino) {
         {"getdents64",                   (void*)my_getdents64,     (void**)&real_getdents64},
         {"getdents",                     (void*)my_getdents,       (void**)&real_getdents},
         {"openat2",                      (void*)my_openat2,        (void**)&real_openat2},
+        {"dl_iterate_phdr",              (void*)my_dl_iterate_phdr,(void**)&real_dl_iterate_phdr},
+        {"mmap",                         (void*)my_mmap,           (void**)&real_mmap},
     };
     for (size_t i = 0; i < sizeof(hooks)/sizeof(hooks[0]); ++i) {
         g_api->pltHookRegister(dev, ino, hooks[i].name, hooks[i].impl, hooks[i].backup);
@@ -807,6 +860,8 @@ static void init_real_symbols(void) {
     real_getdents64 = (decltype(real_getdents64))dlsym(RTLD_NEXT, "getdents64");
     real_getdents   = (decltype(real_getdents))dlsym(RTLD_NEXT, "getdents");
     real_openat2    = (decltype(real_openat2))dlsym(RTLD_NEXT, "openat2");
+    real_dl_iterate_phdr = (decltype(real_dl_iterate_phdr))dlsym(RTLD_NEXT, "dl_iterate_phdr");
+    real_mmap       = (decltype(real_mmap))dlsym(RTLD_NEXT, "mmap");
 }
 
 /* ── JNI SystemProperties hooks ──
