@@ -57,7 +57,6 @@ static int            (*real_faccessat)(int, const char *, int, int)            
 static int            (*real_stat)(const char *, struct stat *)                  = nullptr;
 static int            (*real_lstat)(const char *, struct stat *)                 = nullptr;
 static int            (*real_fstatat)(int, const char *, struct stat *, int)     = nullptr;
-static int            (*real_fstat)(int, struct stat *)                          = nullptr;
 static ssize_t        (*real_readlink)(const char *, char *, size_t)             = nullptr;
 static ssize_t        (*real_readlinkat)(int, const char *, char *, size_t)      = nullptr;
 static struct dirent *(*real_readdir)(DIR *)                                    = nullptr;
@@ -68,9 +67,6 @@ static int            (*real_ptrace)(int, ...)                                  
 static long           (*real_syscall)(long, ...)                                  = nullptr;
 static int            (*real_prop_get)(const char *, char *, size_t)             = nullptr;
 static const prop_info *(*real_prop_find)(const char *)                          = nullptr;
-static int            (*real_prop_read)(const prop_info *, char *, size_t)        = nullptr;
-static void           (*real_prop_read_callback)(const prop_info *,
-        void (*)(const char *, const char *, uint32_t, void *), void *)          = nullptr;
 static FILE           *(*real_fopen)(const char *, const char *)                  = nullptr;
 static DIR            *(*real_opendir)(const char *)                              = nullptr;
 static DIR            *(*real_fdopendir)(int)                                    = nullptr;
@@ -85,7 +81,6 @@ static int            (*real_getdents64)(unsigned int, struct dirent *, unsigned
 static int            (*real_getdents)(unsigned int, struct dirent *, unsigned int) = nullptr;
 static int            (*real_openat2)(int, const char *, struct open_how *, size_t) = nullptr;
 static int            (*real_dl_iterate_phdr)(int (*)(struct dl_phdr_info *, size_t, void *), void *) = nullptr;
-static void           *(*real_mmap)(void *, size_t, int, int, int, off_t)           = nullptr;
 static int            (*real_android_log_print)(int, const char *, const char *, ...) = nullptr;
 static int            (*real_android_log_write)(int, const char *, const char *)     = nullptr;
 
@@ -146,12 +141,6 @@ static bool is_hidden_path(const char *path) {
         "/data/local/su","/data/local/bin/su","/data/local/xbin/su",
         "superuser","supersu","/system/app/Superuser",
         "busybox","resetprop","sepolicy","supolicy",
-        "/sys/fs/selinux/enforce","/sys/fs/selinux/booleans",
-        "/sys/fs/selinux/attr/current","/sys/fs/selinux/attr/exec",
-        "/sys/fs/selinux/attr/fscreate","/sys/fs/selinux/attr/keycreate",
-        "/sys/fs/selinux/attr/sockcreate","/sys/fs/selinux/attr/prev",
-        "/sys/fs/selinux/context","/sys/fs/selinux/access",
-        "/sys/fs/selinux/create","/sys/fs/selinux/member",
         "su_stealth","stealth_ultimate","/cache/stealth_ultimate",
         "noshufou.android.su","thirdparty.superuser","chainfire.supersu",
         "koushikdutta.superuser","zachspong.temprootremovejb",
@@ -177,7 +166,7 @@ static bool is_hidden_name(const char *name) {
     if (!name || !*name) return false;
     static const char *const kHN[] = {
         ".magisk","magisk","magiskd","magiskpolicy","magiskboot",
-        "modules","modules_update","zygisk","post-fs-data.d","service.d",
+        "zygisk","post-fs-data.d","service.d",
         "ksu","ksud","KernelSU","apatch","apd",
         "lspd","riru","xposed","lsposed","shamiko","substrate",
         "frida","frida-server","su",".su","busybox",
@@ -196,13 +185,15 @@ static bool is_hidden_name(const char *name) {
 
 static bool should_hide_maps_line(const char *line) {
     if (!line) return false;
-    /* Hide memfd and deleted entries — these are Zygisk module injection traces */
-    if (su_strstr(line, "/memfd:jit-cache") || su_strstr(line, "memfd:") ||
-        su_strstr(line, "/dev/zero (deleted)") || su_strstr(line, "[anon:")) {
-        /* Only hide if it looks like an injected lib (not normal JIT) */
-        if (su_strstr(line, "r-xp") && (su_strstr(line, "deleted") || su_strstr(line, "memfd"))) {
+    /* Hide memfd and deleted entries — Zygisk module injection traces */
+    if (su_strstr(line, "memfd:") || su_strstr(line, "/dev/zero (deleted)")) {
+        if (su_strstr(line, "r-xp") || su_strstr(line, "r-xs")) {
             return true;
         }
+    }
+    /* Hide anonymous executable mappings */
+    if (su_strstr(line, "[anon:") && (su_strstr(line, "r-xp") || su_strstr(line, "r-xs"))) {
+        return true;
     }
     static const char *const kP[] = {
         "magisk","/.magisk","ksu","ksud","apatch","apd","KernelSU",
@@ -210,7 +201,8 @@ static bool should_hide_maps_line(const char *line) {
         "riru","shamiko","substrate","su_stealth","stealth",
         "/data/adb","/sbin/.magisk","/debug_ramdisk","zygisk",
         "zygisksu","zygiskd","rezygisk","su_mod",
-        "libzygisk.so","stealth_ultimate","su_stealth", nullptr
+        "libzygisk.so","stealth_ultimate","su_stealth",
+        "re.frida","gum-js-loop", nullptr
     };
     for (size_t i = 0; kP[i]; ++i) if (su_strstr(line, kP[i])) return true;
     return false;
@@ -448,6 +440,19 @@ static const char *spoof_value_for(const char *key) {
         {"ro.product.cpu.abilist", "arm64-v8a,armeabi-v7a,armeabi"},
         {"ro.product.cpu.abilist32", "armeabi-v7a,armeabi"},
         {"ro.product.cpu.abilist64", "arm64-v8a"},
+        {"ro.product.first_api_level", "32"},
+        {"ro.product.vendor.name", "bluejay"},
+        {"ro.product.vendor.device", "bluejay"},
+        {"ro.product.vendor.brand", "google"},
+        {"ro.product.vendor.manufacturer", "Google"},
+        {"ro.product.vendor.model", "Pixel 6a"},
+        {"ro.product.system.name", "bluejay"},
+        {"ro.product.system.device", "bluejay"},
+        {"ro.product.system.brand", "google"},
+        {"ro.product.odm.name", "bluejay"},
+        {"ro.product.odm.device", "bluejay"},
+        {"ro.crypto.state", "encrypted"},
+        {"ro.crypto.type", "block"},
         {"ro.boot.verifiedbootstate", "green"},
         {"ro.boot.flash.locked", "1"},
         {"ro.boot.veritymode", "enforcing"},
@@ -460,8 +465,6 @@ static const char *spoof_value_for(const char *key) {
         {"ro.boot.vbmeta.size", "0x1000"},
         {"ro.boot.vbmeta.digest", "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"},
         {"ro.boot.keymaster", "1"},
-        {"ro.boot.veritymode", "enforcing"},
-        {"ro.boot.verifiedbootstate", "green"},
         {"ro.debuggable", "0"},
         {"ro.secure", "1"},
         {"ro.bootmode", "normal"},
@@ -486,7 +489,6 @@ static const char *spoof_value_for(const char *key) {
         {"persist.sys.pixelprops.gms", ""},
         {"persist.sys.pixelprops.com", ""},
         {"persist.sys.pixelprops.retail", ""},
-        {"ro.build.fingerprint", SPOOF_FP},
         {nullptr, nullptr}
     };
     for (size_t i = 0; map[i].k; ++i) if (su_streq(key, map[i].k)) return map[i].v;
@@ -517,12 +519,12 @@ static int create_filtered_memfd(const char *path) {
     if (real_fd < 0) return -1;
 
     /* Read entire content into a buffer */
-    char *buf = (char*)malloc(1024 * 256);  /* 256KB max */
+    char *buf = (char*)malloc(1024 * 1024);  /* 1MB max */
     if (!buf) { close(real_fd); return -1; }
     size_t total = 0;
     ssize_t n;
-    while (total < 1024 * 256 - 1 &&
-           (n = real_read ? real_read(real_fd, buf + total, 1024 * 256 - 1 - total) : -1) > 0) {
+    while (total < 1024 * 1024 - 1 &&
+           (n = real_read ? real_read(real_fd, buf + total, 1024 * 1024 - 1 - total) : -1) > 0) {
         total += (size_t)n;
     }
     close(real_fd);
@@ -571,8 +573,8 @@ static int create_filtered_memfd(const char *path) {
         patch_cmdline(buf, total);
     }
 
-    /* Create memfd and write filtered content */
-    int memfd = syscall(SYS_memfd_create, "proc", 0);
+    /* Create memfd and write filtered content — use empty name to hide trace */
+    int memfd = syscall(SYS_memfd_create, "", 0);
     if (memfd < 0) { free(buf); return -1; }
     if (total > 0) {
         ssize_t written = 0;
@@ -645,15 +647,9 @@ static int my_lstat(const char *path, struct stat *buf) {
     return real_lstat ? real_lstat(path, buf) : -1;
 }
 
-static int my_fstatat(int dirfd, const char *path, struct stat *buf, int flag) {
+static int my_fstatat(int dirfd, const char *path, struct stat *buf, int flags) {
     if (is_hidden_path(path)) { if (buf) memset(buf, 0, sizeof(*buf)); errno = ENOENT; return -1; }
-    return real_fstatat ? real_fstatat(dirfd, path, buf, flag) : -1;
-}
-
-static int my_fstat(int fd, struct stat *buf) {
-    int r = real_fstat ? real_fstat(fd, buf) : -1;
-    /* If the fd points to a hidden path, mask stat as if regular system file */
-    return r;
+    return real_fstatat ? real_fstatat(dirfd, path, buf, flags) : -1;
 }
 
 static ssize_t my_readlink(const char *path, char *buf, size_t size) {
@@ -727,6 +723,14 @@ static int my_ptrace(int request, ...) {
 }
 
 static long my_syscall(long nr, ...) {
+    if (!g_hidden) {
+        /* Not hidden — pass through all syscalls */
+        va_list ap; va_start(ap, nr);
+        long a1 = va_arg(ap, long), a2 = va_arg(ap, long), a3 = va_arg(ap, long);
+        long a4 = va_arg(ap, long), a5 = va_arg(ap, long), a6 = va_arg(ap, long);
+        va_end(ap);
+        return real_syscall ? real_syscall(nr, a1, a2, a3, a4, a5, a6) : -1;
+    }
     va_list ap; va_start(ap, nr);
     switch (nr) {
         case SYS_openat: {
@@ -736,7 +740,27 @@ static long my_syscall(long nr, ...) {
             mode_t md = va_arg(ap, mode_t);
             va_end(ap);
             if (is_hidden_path(p)) { errno = ENOENT; return -1; }
+            if (is_proc_filterable(p)) {
+                int memfd = create_filtered_memfd(p);
+                if (memfd >= 0) return memfd;
+            }
             return real_openat ? real_openat(dfd, p, fl, md) : -1;
+        }
+        case SYS_read: {
+            int fd = va_arg(ap, int);
+            void *buf = va_arg(ap, void *);
+            size_t count = va_arg(ap, size_t);
+            va_end(ap);
+            if (!buf || count == 0) return 0;
+            ssize_t n = real_read ? real_read(fd, buf, count) : -1;
+            if (n > 0) {
+                int kind = fd_filter_kind(fd);
+                if (kind == 1) filter_text_lines((char*)buf, (size_t)n);
+                else if (kind == 2) patch_tracerpid((char*)buf, (size_t)n);
+                else if (kind == 3) filter_environ((char*)buf, (size_t)n);
+                else if (kind == 4) patch_cmdline((char*)buf, (size_t)n);
+            }
+            return n;
         }
 #ifdef SYS_access
         case SYS_access: {
@@ -751,9 +775,10 @@ static long my_syscall(long nr, ...) {
             int dfd = va_arg(ap, int);
             const char *p = va_arg(ap, const char *);
             int m = va_arg(ap, int);
+            int fl = va_arg(ap, int);
             va_end(ap);
             if (is_hidden_path(p)) { errno = ENOENT; return -1; }
-            return real_faccessat ? real_faccessat(dfd, p, m, 0) : -1;
+            return real_faccessat ? real_faccessat(dfd, p, m, fl) : -1;
         }
         case SYS_readlinkat: {
             int dfd = va_arg(ap, int);
@@ -804,22 +829,6 @@ static const prop_info *my_prop_find(const char *name) {
     const char *v = spoof_value_for(name);
     if (v && *v == '\0') return nullptr;  /* hide this property entirely */
     return real_prop_find ? real_prop_find(name) : nullptr;
-}
-
-static int my_prop_read(const prop_info *pi, char *value, size_t size) {
-    /* We don't know the key from pi alone without __system_property_get_name.
-     * Bionic has __system_property_get_name but it's not always exported.
-     * Fall back to real_read and then we cannot override per-key here.
-     * Instead, callers usually use get() which we already hook. */
-    return real_prop_read ? real_prop_read(pi, value, size) : 0;
-}
-
-static void my_prop_read_callback(const prop_info *pi,
-        void (*cb)(const char *, const char *, uint32_t, void *), void *cookie) {
-    /* Without the key name we cannot spoof here reliably. Pass through.
-     * The primary path (SystemProperties.get) uses __system_property_get
-     * which IS hooked. */
-    if (real_prop_read_callback) real_prop_read_callback(pi, cb, cookie);
 }
 
 /* ── fopen/opendir/scandir hooks ── */
@@ -929,6 +938,10 @@ static int my_getdents(unsigned int fd, struct dirent *dirp, unsigned int count)
 struct open_how;
 static int my_openat2(int dfd, const char *path, struct open_how *how, size_t sz) {
     if (is_hidden_path(path)) { errno = ENOENT; return -1; }
+    if (is_proc_filterable(path)) {
+        int memfd = create_filtered_memfd(path);
+        if (memfd >= 0) return memfd;
+    }
     return real_openat2 ? real_openat2(dfd, path, how, sz) : -1;
 }
 
@@ -962,18 +975,7 @@ static int my_dl_iterate_phdr(int (*cb)(struct dl_phdr_info *, size_t, void *), 
     return r;
 }
 
-/* mmap: if mapping /proc/self/mem for memory scanning, we can't easily
- * intercept the read, but we can return failure for hidden fd paths.
- * Most detectors use open+read on maps, not mmap on mem. */
-static void *my_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
-    if (fd >= 0 && (prot & PROT_READ)) {
-        int kind = fd_filter_kind(fd);
-        if (kind == 1 || kind == 2 || kind == 3 || kind == 4) {
-            /* Let it map — the read hook handles content filtering */
-        }
-    }
-    return real_mmap ? real_mmap(addr, length, prot, flags, fd, offset) : MAP_FAILED;
-}
+/* mmap hook removed — was a no-op, wasted registration slot */
 
 /* execve/execv hooks removed — they block su binary in processes that need
  * root access, causing Termux/MT Manager to lose root. File path blocking
@@ -1023,7 +1025,6 @@ static void register_hooks_for_object(dev_t dev, ino_t ino) {
         {"stat",                         (void*)my_stat,          (void**)&real_stat},
         {"lstat",                        (void*)my_lstat,         (void**)&real_lstat},
         {"fstatat",                      (void*)my_fstatat,       (void**)&real_fstatat},
-        {"fstat",                        (void*)my_fstat,         (void**)&real_fstat},
         {"readlink",                     (void*)my_readlink,      (void**)&real_readlink},
         {"readlinkat",                   (void*)my_readlinkat,    (void**)&real_readlinkat},
         {"readdir",                      (void*)my_readdir,       (void**)&real_readdir},
@@ -1034,8 +1035,6 @@ static void register_hooks_for_object(dev_t dev, ino_t ino) {
         {"syscall",                      (void*)my_syscall,      (void**)&real_syscall},
         {"__system_property_get",        (void*)my_prop_get,      (void**)&real_prop_get},
         {"__system_property_find",       (void*)my_prop_find,     (void**)&real_prop_find},
-        {"__system_property_read",       (void*)my_prop_read,     (void**)&real_prop_read},
-        {"__system_property_read_callback", (void*)my_prop_read_callback, (void**)&real_prop_read_callback},
         {"fopen",                        (void*)my_fopen,         (void**)&real_fopen},
         {"opendir",                      (void*)my_opendir,       (void**)&real_opendir},
         {"fdopendir",                    (void*)my_fdopendir,     (void**)&real_fdopendir},
@@ -1051,7 +1050,6 @@ static void register_hooks_for_object(dev_t dev, ino_t ino) {
         {"getdents",                     (void*)my_getdents,       (void**)&real_getdents},
         {"openat2",                      (void*)my_openat2,        (void**)&real_openat2},
         {"dl_iterate_phdr",              (void*)my_dl_iterate_phdr,(void**)&real_dl_iterate_phdr},
-        {"mmap",                         (void*)my_mmap,           (void**)&real_mmap},
         {"__android_log_print",          (void*)my_android_log_print, (void**)&real_android_log_print},
         {"__android_log_write",          (void*)my_android_log_write, (void**)&real_android_log_write},
     };
@@ -1130,7 +1128,6 @@ static void init_real_symbols(void) {
     real_stat       = (decltype(real_stat))dlsym(RTLD_NEXT, "stat");
     real_lstat      = (decltype(real_lstat))dlsym(RTLD_NEXT, "lstat");
     real_fstatat    = (decltype(real_fstatat))dlsym(RTLD_NEXT, "fstatat");
-    real_fstat      = (decltype(real_fstat))dlsym(RTLD_NEXT, "fstat");
     real_readlink   = (decltype(real_readlink))dlsym(RTLD_NEXT, "readlink");
     real_readlinkat = (decltype(real_readlinkat))dlsym(RTLD_NEXT, "readlinkat");
     real_readdir    = (decltype(real_readdir))dlsym(RTLD_NEXT, "readdir");
@@ -1141,8 +1138,6 @@ static void init_real_symbols(void) {
     real_syscall    = (decltype(real_syscall))dlsym(RTLD_NEXT, "syscall");
     real_prop_get   = (decltype(real_prop_get))dlsym(RTLD_NEXT, "__system_property_get");
     real_prop_find  = (decltype(real_prop_find))dlsym(RTLD_NEXT, "__system_property_find");
-    real_prop_read  = (decltype(real_prop_read))dlsym(RTLD_NEXT, "__system_property_read");
-    real_prop_read_callback = (decltype(real_prop_read_callback))dlsym(RTLD_NEXT, "__system_property_read_callback");
     real_fopen      = (decltype(real_fopen))dlsym(RTLD_NEXT, "fopen");
     real_opendir    = (decltype(real_opendir))dlsym(RTLD_NEXT, "opendir");
     real_fdopendir  = (decltype(real_fdopendir))dlsym(RTLD_NEXT, "fdopendir");
@@ -1156,7 +1151,6 @@ static void init_real_symbols(void) {
     real_getdents   = (decltype(real_getdents))dlsym(RTLD_NEXT, "getdents");
     real_openat2    = (decltype(real_openat2))dlsym(RTLD_NEXT, "openat2");
     real_dl_iterate_phdr = (decltype(real_dl_iterate_phdr))dlsym(RTLD_NEXT, "dl_iterate_phdr");
-    real_mmap       = (decltype(real_mmap))dlsym(RTLD_NEXT, "mmap");
     real_android_log_print = (decltype(real_android_log_print))dlsym(RTLD_NEXT, "__android_log_print");
     real_android_log_write = (decltype(real_android_log_write))dlsym(RTLD_NEXT, "__android_log_write");
 }
