@@ -126,6 +126,9 @@ static int            (*real_prop_foreach)(void (*)(const prop_info*, void*), vo
 static int            (*real_poll)(struct pollfd *, nfds_t, int)                      = nullptr;
 static int            (*real_ppoll)(struct pollfd *, nfds_t, const struct timespec*, const sigset_t*) = nullptr;
 
+/* getcwd */
+static char           *(*real_getcwd)(char *, size_t)                                = nullptr;
+
 /* dl_iterate_phdr interceptor state */
 static int (*g_user_phdr_cb)(struct dl_phdr_info *, size_t, void *) = nullptr;
 static void *g_user_phdr_data = nullptr;
@@ -789,8 +792,17 @@ static int create_filtered_memfd(const char *path) {
                   su_strstr(path, "/proc/net/tcp6") || su_strstr(path, "/proc/net/raw") ||
                   su_strstr(path, "/proc/self/net/unix") || su_strstr(path, "/proc/self/net/tcp") ||
                   su_strstr(path, "/proc/self/net/tcp6");
+    bool is_misc_proc = su_streq(path, "/proc/self/loginuid") ||
+                        su_streq(path, "/proc/self/sessionid") ||
+                        su_streq(path, "/proc/self/oom_score_adj") ||
+                        su_strstr(path, "/proc/self/cpuset") ||
+                        su_strstr(path, "/proc/self/limits") ||
+                        su_streq(path, "/proc/self/oom_score") ||
+                        su_streq(path, "/proc/self/loginuid") ||
+                        su_strstr(path, "/proc/self/maps") ||
+                        su_strstr(path, "/proc/self/smaps");
     if (!is_maps && !is_mountinfo && !is_environ && !is_status && !is_cmdline &&
-        !is_stat && !is_attr && !is_cgroup && !is_wchan && !is_filesystems && !is_net) return -1;
+        !is_stat && !is_attr && !is_cgroup && !is_wchan && !is_filesystems && !is_net && !is_misc_proc) return -1;
 
     /* Read the real file content */
     int real_fd = real_openat ? real_openat(AT_FDCWD, path, O_RDONLY, 0) : -1;
@@ -934,6 +946,54 @@ static int create_filtered_memfd(const char *path) {
             if (nl) line_start = nl + 1; else break;
         }
         total = w;
+    } else if (is_misc_proc) {
+        /* v5.0: loginuid/sessionid/oom_score_adj — return benign values */
+        if (su_strstr(path, "loginuid")) {
+            /* loginuid: 0 = root, 4294967295 = none. Return 4294967295 (not logged in as root) */
+            const char *safe = "4294967295";
+            size_t slen = strlen(safe);
+            memcpy(buf, safe, slen);
+            total = slen;
+        } else if (su_strstr(path, "sessionid")) {
+            const char *safe = "4294967295";
+            size_t slen = strlen(safe);
+            memcpy(buf, safe, slen);
+            total = slen;
+        } else if (su_strstr(path, "oom_score_adj")) {
+            /* Normal app oom_score_adj is typically 0 or negative */
+            const char *safe = "0";
+            size_t slen = strlen(safe);
+            memcpy(buf, safe, slen);
+            total = slen;
+        } else if (su_strstr(path, "limits")) {
+            /* Filter limits file for root-specific entries */
+            size_t w = 0;
+            char *line_start = buf;
+            while (line_start < buf + total) {
+                char *nl = (char*)memchr(line_start, '\n', buf + total - line_start);
+                size_t line_len = nl ? (size_t)(nl - line_start + 1) : (buf + total - line_start);
+                char tmp[512];
+                size_t copy = line_len < sizeof(tmp) - 1 ? line_len : sizeof(tmp) - 1;
+                memcpy(tmp, line_start, copy);
+                tmp[copy] = '\0';
+                /* Hide lines that differ for root */
+                bool hide = su_strstr(tmp, "unlimited") && su_strstr(tmp, "Max");
+                if (!hide) {
+                    memmove(buf + w, line_start, line_len);
+                    w += line_len;
+                }
+                if (nl) line_start = nl + 1; else break;
+            }
+            total = w;
+        } else if (su_strstr(path, "cpuset")) {
+            /* Replace root cgroup path with benign one */
+            if (su_strstr(buf, "magisk") || su_strstr(buf, "zygisk") || su_strstr(buf, "root")) {
+                const char *safe = "/foreground";
+                size_t slen = strlen(safe);
+                memcpy(buf, safe, slen);
+                total = slen;
+            }
+        }
     }
 
     /* Create memfd and write filtered content — use empty name to hide trace */
@@ -978,6 +1038,9 @@ static inline bool is_proc_filterable(const char *path) {
            su_strstr(path, "/proc/net/tcp6") || su_strstr(path, "/proc/net/raw") ||
            su_strstr(path, "/proc/self/net/unix") || su_strstr(path, "/proc/self/net/tcp") ||
            su_strstr(path, "/proc/self/net/tcp6") ||
+           su_streq(path, "/proc/self/loginuid") || su_streq(path, "/proc/self/sessionid") ||
+           su_streq(path, "/proc/self/oom_score_adj") || su_streq(path, "/proc/self/oom_score") ||
+           su_strstr(path, "/proc/self/cpuset") || su_strstr(path, "/proc/self/limits") ||
            (su_starts(path, "/proc/") && (su_strstr(path, "/maps") || su_strstr(path, "/mounts") ||
             su_strstr(path, "/environ") || su_strstr(path, "/status") ||
             su_strstr(path, "/cmdline") || su_strstr(path, "/stat") ||
@@ -1033,16 +1096,72 @@ static int my_fstatat(int dirfd, const char *path, struct stat *buf, int flags) 
     return real_fstatat ? real_fstatat(dirfd, path, buf, flags) : -1;
 }
 
+/* v5.0: readlink result filtering.
+ * Native Detector reads /proc/self/fd/N symlinks to find magisk/zygisk fds.
+ * We filter the RESULT of readlink to hide root-related targets. */
+static void filter_readlink_result(char *buf, ssize_t *n) {
+    if (!buf || !n || *n <= 0) return;
+    /* Check if the link target contains root keywords */
+    if (su_strstr(buf, "magisk") || su_strstr(buf, "zygisk") ||
+        su_strstr(buf, "ksu") || su_strstr(buf, "ksud") ||
+        su_strstr(buf, "apatch") || su_strstr(buf, "apd") ||
+        su_strstr(buf, "frida") || su_strstr(buf, "linjector") ||
+        su_strstr(buf, "su_stealth") || su_strstr(buf, "stealth") ||
+        su_strstr(buf, "riru") || su_strstr(buf, "xposed") ||
+        su_strstr(buf, "lspd") || su_strstr(buf, "shamiko") ||
+        su_strstr(buf, "/data/adb") || su_strstr(buf, "/sbin/.magisk") ||
+        su_strstr(buf, "/debug_ramdisk") ||
+        su_strstr(buf, "memfd:zygisk") || su_strstr(buf, "memfd:magisk") ||
+        su_strstr(buf, "playintegrityfix") || su_strstr(buf, "pif")) {
+        /* Replace with a benign path */
+        const char *safe = "/system/lib64/libc.so";
+        size_t slen = strlen(safe);
+        if (slen < (size_t)*n) {
+            memcpy(buf, safe, slen);
+            buf[slen] = '\0';
+            *n = (ssize_t)slen;
+        } else {
+            /* Can't fit — return ENOENT */
+            *n = -1;
+            errno = ENOENT;
+        }
+    }
+}
+
 static ssize_t my_readlink(const char *path, char *buf, size_t size) {
     if (is_hidden_path(path)) { errno = ENOENT; return -1; }
-    return real_readlink ? real_readlink(path, buf, size) : -1;
+    ssize_t n = real_readlink ? real_readlink(path, buf, size) : -1;
+    if (n > 0 && g_hidden) filter_readlink_result(buf, &n);
+    return n;
 }
 
 static ssize_t my_readlinkat(int dirfd, const char *path, char *buf, size_t size) {
     if (is_hidden_path(path)) { errno = ENOENT; return -1; }
-    return real_readlinkat ? real_readlinkat(dirfd, path, buf, size) : -1;
+    ssize_t n = real_readlinkat ? real_readlinkat(dirfd, path, buf, size) : -1;
+    if (n > 0 && g_hidden) filter_readlink_result(buf, &n);
+    return n;
 }
 
+/* v5.0: getcwd hook — if CWD is a root directory, spoof it */
+static char *my_getcwd(char *buf, size_t size) {
+    char *r = getcwd(buf, size);
+    if (r && g_hidden) {
+        if (su_strstr(r, "/data/adb") || su_strstr(r, "/sbin/.magisk") ||
+            su_strstr(r, "/debug_ramdisk") || su_strstr(r, "su_stealth") ||
+            su_strstr(r, "stealth") || su_strstr(r, "magisk")) {
+            /* Replace with a safe directory */
+            const char *safe = "/data/data/com.android.shell";
+            size_t slen = strlen(safe);
+            if (slen < size) {
+                memcpy(buf, safe, slen + 1);
+            }
+        }
+    }
+    return r;
+}
+
+/* v5.0: readlink in syscall for /proc/self/fd/ and /proc/self/exe */
+/* Also handle SYS_readlink in my_syscall */
 static struct dirent *my_readdir(DIR *dirp) {
     struct dirent *de;
     while ((de = real_readdir ? real_readdir(dirp) : nullptr)) {
@@ -1202,6 +1321,35 @@ static long my_syscall(long nr, ...) {
             return real_access ? real_access(p, m) : -1;
         }
 #endif
+#ifdef SYS_open
+        case SYS_open: {
+            const char *p = va_arg(ap, const char *);
+            int fl = va_arg(ap, int);
+            mode_t md = va_arg(ap, mode_t);
+            va_end(ap);
+            if (is_hidden_path(p)) { errno = ENOENT; return -1; }
+            if (is_proc_filterable(p)) {
+                int memfd = create_filtered_memfd(p);
+                if (memfd >= 0) return memfd;
+            }
+            return real_open ? real_open(p, fl, md) : -1;
+        }
+#endif
+#ifdef SYS_openat2
+        case SYS_openat2: {
+            int dfd = va_arg(ap, int);
+            const char *p = va_arg(ap, const char *);
+            struct open_how *how = va_arg(ap, struct open_how *);
+            size_t sz = va_arg(ap, size_t);
+            va_end(ap);
+            if (is_hidden_path(p)) { errno = ENOENT; return -1; }
+            if (is_proc_filterable(p)) {
+                int memfd = create_filtered_memfd(p);
+                if (memfd >= 0) return memfd;
+            }
+            return real_openat2 ? real_openat2(dfd, p, how, sz) : -1;
+        }
+#endif
         case SYS_faccessat: {
             int dfd = va_arg(ap, int);
             const char *p = va_arg(ap, const char *);
@@ -1218,8 +1366,22 @@ static long my_syscall(long nr, ...) {
             size_t s = va_arg(ap, size_t);
             va_end(ap);
             if (is_hidden_path(p)) { errno = ENOENT; return -1; }
-            return real_readlinkat ? real_readlinkat(dfd, p, b, s) : -1;
+            ssize_t n = real_readlinkat ? real_readlinkat(dfd, p, b, s) : -1;
+            if (n > 0) filter_readlink_result(b, &n);
+            return n;
         }
+#ifdef SYS_readlink
+        case SYS_readlink: {
+            const char *p = va_arg(ap, const char *);
+            char *b = va_arg(ap, char *);
+            size_t s = va_arg(ap, size_t);
+            va_end(ap);
+            if (is_hidden_path(p)) { errno = ENOENT; return -1; }
+            ssize_t n = real_readlink ? real_readlink(p, b, s) : -1;
+            if (n > 0) filter_readlink_result(b, &n);
+            return n;
+        }
+#endif
         case SYS_uname: {
             struct utsname *u = va_arg(ap, struct utsname *);
             va_end(ap);
@@ -1667,6 +1829,7 @@ static void register_hooks_for_object(dev_t dev, ino_t ino) {
         {"realpath",                     (void*)my_realpath,       (void**)&real_realpath},
         {"statx",                        (void*)my_statx,          (void**)&real_statx},
         {"fcntl",                        (void*)my_fcntl,          (void**)&real_fcntl},
+        {"getcwd",                       (void*)my_getcwd,         (void**)&real_getcwd},
     };
     for (size_t i = 0; i < sizeof(hooks)/sizeof(hooks[0]); ++i) {
         g_api->pltHookRegister(dev, ino, hooks[i].name, hooks[i].impl, hooks[i].backup);
@@ -1783,6 +1946,7 @@ static void init_real_symbols(void) {
     real_prop_foreach = (decltype(real_prop_foreach))dlsym(RTLD_NEXT, "__system_property_foreach");
     real_poll        = (decltype(real_poll))dlsym(RTLD_NEXT, "poll");
     real_ppoll       = (decltype(real_ppoll))dlsym(RTLD_NEXT, "ppoll");
+    real_getcwd      = (decltype(real_getcwd))dlsym(RTLD_NEXT, "getcwd");
 }
 
 /* ── JNI SystemProperties hooks ──
