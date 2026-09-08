@@ -1,6 +1,8 @@
-# Stealth Ultimate v3.0 — Spoof profile
+# Stealth Ultimate v5.0 — Spoof profile
 # Consistent Pixel 6a (bluejay) device profile. Edit to match your target.
 # File: /data/adb/su_stealth/spoof.conf
+# This file is loaded by the Zygisk module at process specialization.
+# Format: KEY=VALUE per line. The key must match a system property name.
 
 # ── Build identity ──
 SPOOF_FINGERPRINT=google/bluejay/bluejay:14/UD1A.240105.004/11207768:user/release-keys

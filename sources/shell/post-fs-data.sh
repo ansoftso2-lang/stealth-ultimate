@@ -1,6 +1,7 @@
 #!/system/bin/sh
-# post-fs-data.sh v7.1 — Maximum hiding with bootloop protection
+# post-fs-data.sh v8.0 — Maximum hiding with bootloop protection
 # All operations are best-effort: if any fails, boot continues normally.
+# Safety-first approach: no operation can cause a bootloop.
 MODDIR=${0%/*}
 DATA_DIR="/data/adb/su_stealth"
 
@@ -12,7 +13,7 @@ chmod 644 "$DATA_DIR/spoof.conf" 2>/dev/null
 LOG="$DATA_DIR/stealth_boot.log"
 log() { echo "$(date '+%H:%M:%S') [boot] $1" >> "$LOG" 2>/dev/null; }
 
-log "=== post-fs-data.sh starting ==="
+log "=== post-fs-data.sh v8.0 starting ==="
 
 # ── Bootloop protection: limit log size ──
 if [ -f "$LOG" ]; then
@@ -23,7 +24,7 @@ if [ -f "$LOG" ]; then
     fi
 fi
 
-# ── 1. SELinux enforce ──
+# ── 1. SELinux enforce (best-effort, no force) ──
 ENF=/sys/fs/selinux/enforce
 if [ -w "$ENF" ]; then
     cur=$(cat "$ENF" 2>/dev/null)
@@ -31,13 +32,13 @@ if [ -w "$ENF" ]; then
     log "SELinux enforce set to 1"
 fi
 
-# ── 2. SELinux policy patches for keymaster access ──
+# ── 2. SELinux policy patches (safe, with timeout) ──
 MAGISKPOLICY="/data/adb/magisk/magiskpolicy"
 [ -x "$MAGISKPOLICY" ] || MAGISKPOLICY="/system/bin/magiskpolicy"
 [ -x "$MAGISKPOLICY" ] || MAGISKPOLICY=$(which magiskpolicy 2>/dev/null)
 
 if [ -x "$MAGISKPOLICY" ]; then
-    # Allow keymaster HAL access (with 5s timeout to prevent boot hang)
+    # Keymaster HAL access (with 5s timeout to prevent boot hang)
     timeout 5 $MAGISKPOLICY --live "allow * hal_keymaster_default:binder call" 2>/dev/null
     timeout 5 $MAGISKPOLICY --live "allow * hal_keymaster_default:binder transfer" 2>/dev/null
     timeout 5 $MAGISKPOLICY --live "allow * hal_keymaster_default:fd use" 2>/dev/null
@@ -47,9 +48,13 @@ if [ -x "$MAGISKPOLICY" ]; then
     timeout 5 $MAGISKPOLICY --live "allow root proc_keymaster:dir search" 2>/dev/null
     timeout 5 $MAGISKPOLICY --live "allow root proc_bootconfig:file r" 2>/dev/null
     timeout 5 $MAGISKPOLICY --live "allow root proc_cmdline:file r" 2>/dev/null
-    log "SELinux policy patched for keymaster + verified boot"
+    # v8.0: additional safe policies for attestation
+    timeout 5 $MAGISKPOLICY --live "allow * hal_keymint_default:binder call" 2>/dev/null
+    timeout 5 $MAGISKPOLICY --live "allow * hal_keymint_default:binder transfer" 2>/dev/null
+    timeout 5 $MAGISKPOLICY --live "allow * hal_keymint_default:fd use" 2>/dev/null
+    log "SELinux policy patched for keymaster/keymint + verified boot"
 else
-    log "WARNING: magiskpolicy not found — SELinux patches skipped"
+    log "WARNING: magiskpolicy not found — SELinux patches skipped (safe)"
 fi
 
 # ── 3. Global property spoofing via resetprop --late ──
@@ -61,7 +66,7 @@ resetprop_late() {
     fi
 }
 
-# Build identity
+# Build identity (Pixel 6a / bluejay)
 resetprop_late ro.build.fingerprint "google/bluejay/bluejay:14/UD1A.240105.004/11207768:user/release-keys"
 resetprop_late ro.bootimage.build.fingerprint "google/bluejay/bluejay:14/UD1A.240105.004/11207768:user/release-keys"
 resetprop_late ro.build.description "google/bluejay/bluejay:14/UD1A.240105.004/11207768:user/release-keys"
@@ -88,7 +93,7 @@ resetprop_late ro.hardware "bluejay"
 resetprop_late ro.bootloader "bluejay-1.0-1068493"
 resetprop_late ro.boot.bootloader "bluejay-1.0-1068493"
 
-# Bootloader / verified boot (maximum effort)
+# Bootloader / verified boot
 resetprop_late ro.boot.verifiedbootstate "green"
 resetprop_late ro.boot.flash.locked "1"
 resetprop_late ro.boot.veritymode "enforcing"
@@ -121,6 +126,21 @@ resetprop_late ro.baseband "g5300q-240105-240111-B-11207768"
 resetprop_late ro.boot.baseband "g5300q-240105-240111-B-11207768"
 resetprop_late ro.gsm.version.baseband "g5300q-240105-240111-B-11207768"
 
+# v8.0: Additional product props for consistency
+resetprop_late ro.product.vendor.name "bluejay"
+resetprop_late ro.product.vendor.device "bluejay"
+resetprop_late ro.product.vendor.brand "google"
+resetprop_late ro.product.vendor.manufacturer "Google"
+resetprop_late ro.product.vendor.model "Pixel 6a"
+resetprop_late ro.product.system.name "bluejay"
+resetprop_late ro.product.system.device "bluejay"
+resetprop_late ro.product.system.brand "google"
+resetprop_late ro.product.odm.name "bluejay"
+resetprop_late ro.product.odm.device "bluejay"
+resetprop_late ro.crypto.state "encrypted"
+resetprop_late ro.crypto.type "block"
+resetprop_late ro.build.date.utc "1704067200"
+
 # Clear root manager traces
 resetprop_late ro.magisk.version ""
 resetprop_late ro.magisk.versionCode ""
@@ -135,16 +155,20 @@ resetprop_late persist.sys.pixelprops.gms ""
 resetprop_late persist.sys.pixelprops.com ""
 resetprop_late persist.sys.pixelprops.retail ""
 
-# VBMeta props
+# v8.0: Clear additional detection props
 resetprop_late ro.boot.vbmeta.hash_alg "sha256"
 resetprop_late ro.boot.vbmeta.size "0x1000"
 resetprop_late ro.boot.vbmeta.digest "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+resetprop_late persist.magisk.log "0"
+resetprop_late persist.magisk.verbose "0"
+resetprop_late ro.revision "0"
+resetprop_late ro.product.first_api_level "32"
+resetprop_late ro.boot.hardware "bluejay"
+resetprop_late ro.boot.hardware.sku "bluejay"
 
 log "Global properties spoofed via resetprop --late"
 
-# ── 4. Patch /proc/cmdline (best-effort) ──
-# This may fail — /proc/cmdline is usually read-only
-# But try to modify the boot config if possible
+# ── 4. /proc/cmdline patching (best-effort) ──
 if [ -w "/proc/cmdline" ] 2>/dev/null; then
     CUR=$(cat /proc/cmdline 2>/dev/null)
     if echo "$CUR" | grep -q "verifiedbootstate=orange\|verifiedbootstate=yellow\|flash.locked=0\|vbmeta.device_state=unlocked"; then
@@ -160,30 +184,4 @@ else
     log "/proc/cmdline not writable (expected) — Zygisk hook handles this in-process"
 fi
 
-# ── 5. Hide Magisk/ksu traces from /proc ──
-# Remove Magisk env variables from init environ
-for key in MAGISK_INJECTOR MAGISK_PROCESS MAGISK_TMP; do
-    if [ -f "/proc/self/environ" ]; then
-        : # Can't modify /proc/self/environ directly — Zygisk hook handles this
-    fi
-done
-
-# ── 6. Try to access keymaster and patch attestation ──
-# This is best-effort — without keybox we can only try to modify the
-# attestation challenge response, not the keybox itself.
-KEYMASTER_HALS=$(find /proc -name "keymaster" -type d 2>/dev/null)
-if [ -n "$KEYMASTER_HALS" ]; then
-    log "Keymaster HAL found: $KEYMASTER_HALS"
-fi
-
-# Try to set keystore properties that affect attestation
-resetprop_late ro.boot.verifiedbootstate "green"
-resetprop_late ro.boot.flash.locked "1"
-resetprop_late ro.boot.vbmeta.device_state "locked"
-resetprop_late ro.boot.veritymode "enforcing"
-
-# ── 7. Disable Magisk verbose logging (reduces traces) ──
-resetprop_late persist.magisk.log "0"
-resetprop_late persist.magisk.verbose "0"
-
-log "=== post-fs-data.sh complete ==="
+log "=== post-fs-data.sh v8.0 complete ==="

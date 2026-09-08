@@ -1,5 +1,5 @@
 ﻿#!/system/bin/sh
-# service.sh v3.0 — Post-boot: refresh root-UID list across frameworks.
+# service.sh v5.0 — Post-boot: refresh root-UID list across frameworks.
 DATA_DIR="/data/adb/su_stealth"
 LOG="$DATA_DIR/svc.log"
 

@@ -34,6 +34,9 @@ COMMON_FLAGS=(
     -fno-rtti
     -Wall
     -Wextra
+    -Wno-unused-parameter
+    -Wno-unused-variable
+    -Wno-unused-function
     -nostdlib++
     -Wl,--hash-style=both
     -Wl,-z,global

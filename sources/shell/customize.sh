@@ -1,11 +1,11 @@
 ﻿#!/system/bin/sh
-# customize.sh v6.0 — Universal installer + auto-install companion modules
+# customize.sh v8.0 — Universal installer + auto-install companion modules
 SKIPUNZIP=0
 
 DATA_DIR="/data/adb/su_stealth"
 
 ui_print " ================================"
-ui_print "  Stealth Ultimate v6.0"
+ui_print "  Stealth Ultimate v5.0"
 ui_print "  Universal Zygisk Anti-Detection"
 ui_print " ================================"
 ui_print ""
