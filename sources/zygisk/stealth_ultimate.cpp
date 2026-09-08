@@ -486,6 +486,276 @@ static bool is_hidden_process_name(const char *name) {
     return false;
 }
 
+/* ── v5.1: Anti-Magic-Mount detection (vvb2060/MagiskDetector) ──
+ * MagiskDetector reads /proc/self/mountinfo to get /data device major:minor,
+ * then scans /proc/self/maps for /system/ entries with the SAME device.
+ * If they match → Magic Mount detected.
+ * Fix: in maps filtering, replace the device number for /system/, /vendor/,
+ * /product/, /system_ext/ lines so they don't match /data device. */
+static bool g_dev_initialized = false;
+static int g_data_major = 0, g_data_minor = 0;
+
+static void init_data_device(void) {
+    if (g_dev_initialized) return;
+    g_dev_initialized = true;
+    /* Read /proc/self/mountinfo to find / /data entry */
+    int fd = real_openat ? real_openat(AT_FDCWD, "/proc/self/mountinfo", O_RDONLY, 0) : -1;
+    if (fd < 0) return;
+    char buf[8192];
+    ssize_t total = 0;
+    while (total < (ssize_t)sizeof(buf) - 1) {
+        ssize_t n = real_read ? real_read(fd, buf + total, sizeof(buf) - 1 - total) : -1;
+        if (n <= 0) break;
+        total += n;
+    }
+    if (fd >= 0) close(fd);
+    buf[total] = '\0';
+    /* Look for " /data " line */
+    char *p = buf;
+    while (p && *p) {
+        char *nl = strchr(p, '\n');
+        if (nl) *nl = '\0';
+        if (strstr(p, " /data ") && !strstr(p, " /data/")) {
+            sscanf(p, "%*d %*d %d:%d", &g_data_major, &g_data_minor);
+            break;
+        }
+        if (nl) { *nl = '\n'; p = nl + 1; } else break;
+    }
+}
+
+/* Fix maps line: if it's a /system/ path with /data device, replace device number */
+static void fix_maps_device(char *line, size_t len) {
+    if (!line || len == 0) return;
+    init_data_device();
+    if (g_data_major == 0 && g_data_minor == 0) return;
+    /* Check if this line has a system path */
+    static const char *const sys_paths[] = {
+        " /system/", " /vendor/", " /product/", " /system_ext/", nullptr
+    };
+    bool is_sys = false;
+    for (int i = 0; sys_paths[i]; ++i) {
+        if (strstr(line, sys_paths[i])) { is_sys = true; break; }
+    }
+    if (!is_sys) return;
+    /* Parse device field: format is "addr perms offset dev:ino inode path"
+     * The device field is at position 4 (0-indexed) after splitting by spaces */
+    /* Find the dev:ino pattern (hex:hex) and replace with 0:1 (system partition) */
+    char *p = line;
+    int space_count = 0;
+    while (*p && space_count < 3) {
+        if (*p == ' ') space_count++;
+        p++;
+    }
+    /* Now p should point to the device field "XX:XX" */
+    if (*p && space_count == 3) {
+        /* Check if it matches /data device */
+        int f = 0, s = 0;
+        if (sscanf(p, "%x:%x", &f, &s) == 2) {
+            if (f == g_data_major && s == g_data_minor) {
+                /* Replace with a fake device number (0b:00 = /dev/block/dm-0 typically) */
+                /* Find the end of the device field */
+                char *end = p;
+                while (*end && *end != ' ') end++;
+                /* Replace with "0:0" to obscure the real device */
+                char replacement[] = "0:0";
+                size_t rlen = sizeof(replacement) - 1;
+                size_t old_len = end - p;
+                if (rlen <= old_len) {
+                    memcpy(p, replacement, rlen);
+                    /* Shift remaining content */
+                    if (rlen < old_len) {
+                        memmove(p + rlen, end, strlen(end) + 1);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* ── v5.1: Remove module from linker's soinfo list (anti-LSPosed/NativeDetector) ──
+ * LSPosed/NativeDetector reads linker's internal solist linked list directly
+ * from memory. It checks realpath and soname of every loaded library for
+ * "zygisk" or "riru" keywords. We must unlink our soinfo from the list.
+ *
+ * Approach: find linker base from /proc/self/maps, parse its ELF to locate
+ * the solist and g_ld_preloads symbols, then walk the list and remove entries
+ * containing detectable keywords. */
+
+/* ELF symbol lookup helpers (minimal) */
+static void *su_find_linker_base(void) {
+    FILE *fp = real_fopen ? real_fopen("/proc/self/maps", "r") : nullptr;
+    if (!fp) return nullptr;
+    char line[512];
+    void *base = nullptr;
+    while (fgets(line, sizeof(line), fp)) {
+        if ((strstr(line, "r-xp") || strstr(line, "r--p")) &&
+            (strstr(line, "/linker") || strstr(line, "/linker64"))) {
+            unsigned long addr = strtoul(line, nullptr, 16);
+            base = (void*)addr;
+            break;
+        }
+    }
+    fclose(fp);
+    return base;
+}
+
+static void *su_elf_lookup_symbol(void *base, const char *symname) {
+    if (!base || !symname) return nullptr;
+    ElfW(Ehdr) *eh = (ElfW(Ehdr)*)base;
+    ElfW(Phdr) *ph = (ElfW(Phdr)*)((char*)base + eh->e_phoff);
+    ElfW(Dyn) *dyn = nullptr;
+    for (int i = 0; i < eh->e_phnum; ++i) {
+        if (ph[i].p_type == PT_DYNAMIC) { dyn = (ElfW(Dyn)*)((char*)base + ph[i].p_vaddr); break; }
+    }
+    if (!dyn) return nullptr;
+    ElfW(Sym) *symtab = nullptr;
+    const char *strtab = nullptr;
+    ElfW(Word) *hash = nullptr;
+    for (ElfW(Dyn) *d = dyn; d->d_tag != DT_NULL; ++d) {
+        if (d->d_tag == DT_SYMTAB) symtab = (ElfW(Sym)*)d->d_un.d_ptr;
+        else if (d->d_tag == DT_STRTAB) strtab = (const char*)d->d_un.d_ptr;
+        else if (d->d_tag == DT_HASH) hash = (ElfW(Word)*)d->d_un.d_ptr;
+    }
+    if (!symtab || !strtab || !hash) return nullptr;
+    ElfW(Word) nbucket = hash[0];
+    ElfW(Word) *bucket = hash + 2;
+    ElfW(Word) *chain = bucket + nbucket;
+    /* Simple hash function (ELF hash) */
+    ElfW(Word) h = 0;
+    for (const char *p = symname; *p; ++p) {
+        h = (h << 4) + *p;
+        h ^= (h >> 24);
+    }
+    ElfW(Word) idx = bucket[h % nbucket];
+    while (idx != 0) {
+        if (strcmp(strtab + symtab[idx].st_name, symname) == 0) {
+            return (void*)((char*)base + symtab[idx].st_value);
+        }
+        idx = chain[idx];
+    }
+    return nullptr;
+}
+
+/* soinfo structure offsets (Android 10+ 64-bit) */
+#ifdef __LP64__
+#define SOINFO_NEXT_OFFSET 0x30
+#define SOINFO_REALPATH_OFFSET 0x1a8
+#else
+#define SOINFO_NEXT_OFFSET 0xa4
+#define SOINFO_REALPATH_OFFSET 0x174
+#endif
+
+static const char *su_soinfo_get_realpath(void *si) {
+    if (!si) return nullptr;
+    return *(const char**)((char*)si + SOINFO_REALPATH_OFFSET);
+}
+
+static void *su_soinfo_get_next(void *si) {
+    if (!si) return nullptr;
+    return *(void**)((char*)si + SOINFO_NEXT_OFFSET);
+}
+
+static bool su_soinfo_should_hide(const char *rp) {
+    if (!rp) return false;
+    static const char *const kDetect[] = {
+        "zygisk", "riru", "magisk", "stealth", "su_stealth",
+        "stealth_ultimate", "shamiko", "xposed", "lspd",
+        "frida", "libgum", "libfrida",
+        nullptr
+    };
+    for (int i = 0; kDetect[i]; ++i) {
+        if (strstr(rp, kDetect[i])) return true;
+    }
+    return false;
+}
+
+static void remove_from_solist(void) {
+    void *linker_base = su_find_linker_base();
+    if (!linker_base) return;
+
+    /* Find solist symbol: __dl__ZL6solist (mangled: linker's static solist) */
+    void **solist_ptr = (void**)su_elf_lookup_symbol(linker_base, "__dl__ZL6solist");
+    /* Also try alternative symbol names for different NDK versions */
+    if (!solist_ptr) solist_ptr = (void**)su_elf_lookup_symbol(linker_base, "__dl__ZL15solist_head_ptr");
+
+    if (solist_ptr && *solist_ptr) {
+        void *prev = nullptr;
+        void *cur = *solist_ptr;
+        int removed = 0;
+        while (cur) {
+            void *next = su_soinfo_get_next(cur);
+            const char *rp = su_soinfo_get_realpath(cur);
+            bool should_remove = su_soinfo_should_hide(rp);
+            if (should_remove) {
+                /* Unlink from linked list */
+                if (prev) {
+                    *(void**)((char*)prev + SOINFO_NEXT_OFFSET) = next;
+                } else {
+                    *solist_ptr = next;
+                }
+                removed++;
+            } else {
+                prev = cur;
+            }
+            cur = next;
+        }
+        LOGI("solist: removed %d entries", removed);
+    }
+
+    /* Clean g_ld_preloads: __dl__ZL13g_ld_preloads is a vector<soinfo*> */
+    void **preloads_ptr = (void**)su_elf_lookup_symbol(linker_base, "__dl__ZL13g_ld_preloads");
+    if (preloads_ptr && *preloads_ptr) {
+        /* vector<soinfo*> layout: { begin_ptr, end_ptr, capacity_ptr } */
+        void **vec = (void**)*preloads_ptr;
+        void **begin = (void**)vec[0];
+        void **end = (void**)vec[1];
+        if (begin && end && end > begin) {
+            size_t count = end - begin;
+            size_t w = 0;
+            for (size_t i = 0; i < count; ++i) {
+                const char *rp = su_soinfo_get_realpath(begin[i]);
+                if (!su_soinfo_should_hide(rp)) {
+                    begin[w++] = begin[i];
+                }
+            }
+            /* Update end pointer */
+            vec[1] = (void*)(begin + w);
+            LOGI("preloads: cleaned %zu/%zu", count - w, count);
+        }
+    }
+}
+
+/* ── v5.1: Read-time content filtering for raw-syscall bypassed reads ──
+ * vvb2060/MagiskDetector uses linux_syscall_support.h which makes raw
+ * syscalls (inline asm svc) that bypass ALL PLT hooks. The detector opens
+ * /proc/self/maps etc. via raw syscall, then uses fgets/fdopen to read.
+ * fgets internally calls read(), which we DO hook. But the fd from raw
+ * syscall is not tracked by our memfd system. So we need to check at
+ * read() time what file the fd points to, and filter content accordingly. */
+static int check_fd_target(int fd) {
+    if (fd < 0) return 0;
+    char link[64];
+    char target[PATH_MAX];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    ssize_t n = real_readlinkat ? real_readlinkat(AT_FDCWD, link, target, sizeof(target) - 1) : -1;
+    if (n <= 0) return 0;
+    target[n] = '\0';
+    /* Check if it's a filterable proc file */
+    if (strstr(target, "/proc/self/maps") || strstr(target, "/proc/self/smaps")) return 1;
+    if (strstr(target, "/proc/self/mountinfo") || strstr(target, "/proc/self/mounts")) return 1;
+    if (strstr(target, "/proc/self/status")) return 2;
+    if (strstr(target, "/proc/self/environ")) return 3;
+    if (strstr(target, "/proc/self/cmdline")) return 4;
+    if (strstr(target, "/proc/self/attr/") || strstr(target, "/proc/self/cgroup")) return 6;
+    if (strstr(target, "/proc/self/wchan") || strstr(target, "/proc/self/stack") ||
+        strstr(target, "/proc/self/syscall") || strstr(target, "/proc/self/sched")) return 8;
+    if (strstr(target, "/proc/self/stat") || strstr(target, "/proc/self/loginuid") ||
+        strstr(target, "/proc/self/sessionid") || strstr(target, "/proc/self/limits")) return 1;
+    if (strstr(target, "/proc/net/unix") || strstr(target, "/proc/net/tcp")) return 7;
+    if (strstr(target, "/proc/filesystems")) return 1;
+    return 0;
+}
+
 /* ── TracerPid patcher ── */
 static void patch_tracerpid(char *buf, size_t len) {
     if (!buf || len == 0) return;
@@ -1211,7 +1481,38 @@ static ssize_t my_read(int fd, void *buf, size_t count) {
     ssize_t n = real_read ? real_read(fd, buf, count) : -1;
     if (n > 0 && g_hidden) {
         int kind = fd_filter_kind(fd);
-        if (kind == 1) filter_text_lines((char*)buf, (size_t)n);
+        /* v5.1: If fd is not from our memfd system, check what file it points to.
+         * This catches raw-syscall bypassed opens (vvb2060/MagiskDetector style). */
+        if (kind == 0) {
+            kind = check_fd_target(fd);
+        }
+        if (kind == 1) {
+            filter_text_lines((char*)buf, (size_t)n);
+            /* v5.1: Also fix device numbers for magic mount detection */
+            /* Apply fix_maps_device to each line */
+            char *p = (char*)buf;
+            while (p && *p && (size_t)(p - (char*)buf) < (size_t)n) {
+                char *nl = (char*)memchr(p, '\n', (size_t)((char*)buf + n - p));
+                size_t line_len = nl ? (size_t)(nl - p + 1) : (size_t)((char*)buf + n - p);
+                char tmp[1024];
+                size_t copy = line_len < sizeof(tmp) - 1 ? line_len : sizeof(tmp) - 1;
+                memcpy(tmp, p, copy);
+                tmp[copy] = '\0';
+                fix_maps_device(tmp, copy);
+                /* Write back if modified */
+                if (strcmp(tmp, p) != 0) {
+                    /* Only copy the modified part */
+                    size_t mod_len = strlen(tmp);
+                    if (mod_len < line_len) {
+                        memmove(p + mod_len + 1, p + line_len, (size_t)((char*)buf + n - p - line_len));
+                        n -= (line_len - mod_len - 1);
+                    }
+                    memcpy(p, tmp, mod_len);
+                    p[mod_len] = '\n';
+                }
+                if (nl) p = nl + 1; else break;
+            }
+        }
         else if (kind == 2) patch_tracerpid((char*)buf, (size_t)n);
         else if (kind == 3) filter_environ((char*)buf, (size_t)n);
         else if (kind == 4) patch_cmdline((char*)buf, (size_t)n);
@@ -1291,6 +1592,8 @@ static long my_syscall(long nr, ...) {
             ssize_t n = real_read ? real_read(fd, buf, count) : -1;
             if (n > 0) {
                 int kind = fd_filter_kind(fd);
+                /* v5.1: Check raw-syscall-bypassed fds */
+                if (kind == 0) kind = check_fd_target(fd);
                 if (kind == 1) filter_text_lines((char*)buf, (size_t)n);
                 else if (kind == 2) patch_tracerpid((char*)buf, (size_t)n);
                 else if (kind == 3) filter_environ((char*)buf, (size_t)n);
@@ -2132,6 +2435,13 @@ public:
         if (g_objects == 0) {
             LOGE("CRITICAL: 0 objects found — hooks will NOT work! proc=%s", proc);
         }
+
+        /* v5.1: Remove module from linker's soinfo list.
+         * This must happen AFTER hooks are installed so our hook functions
+         * remain callable, but BEFORE the app's detection code runs.
+         * Anti-LSPosed/NativeDetector solist scan. */
+        remove_from_solist();
+        LOGI("solist cleanup done");
     }
     void postAppSpecialize(const zygisk::AppSpecializeArgs *) override {}
     /* Do NOT hook system_server — it breaks mount namespace for all forks
