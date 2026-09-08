@@ -20,7 +20,9 @@
  * Targets: Native Detector, Ruru, Momo, Shamiko-detectors, Play Integrity,
  *          banking apps, and all standard root detection methods.
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <jni.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -113,7 +115,6 @@ static int            (*real_connect)(int, const struct sockaddr *, socklen_t)  
 static int            (*real_socket)(int, int, int)                                   = nullptr;
 static char           *(*real_realpath)(const char *, char *)                         = nullptr;
 static int            (*real_statx)(int, const char *, int, unsigned int, void *)     = nullptr;
-static ssize_t        (*real_readlinkat)(int, const char *, char *, size_t)           = nullptr;
 static int            (*real_fcntl)(int, int, ...)                                    = nullptr;
 static int            (*real_ioctl)(int, unsigned long, ...)                          = nullptr;
 
