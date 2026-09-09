@@ -107,6 +107,7 @@ static long           (*real_syscall)(long, ...)                                
 static int            (*real_prop_get)(const char *, char *, size_t)             = nullptr;
 static const prop_info *(*real_prop_find)(const char *)                          = nullptr;
 static FILE           *(*real_fopen)(const char *, const char *)                  = nullptr;
+static FILE           *(*real_fdopen)(int, const char *)                           = nullptr;
 static DIR            *(*real_opendir)(const char *)                              = nullptr;
 static DIR            *(*real_fdopendir)(int)                                    = nullptr;
 static int            (*real_scandir)(const char *, struct dirent ***,
@@ -1797,18 +1798,51 @@ static const prop_info *my_prop_find(const char *name) {
     return real_prop_find ? real_prop_find(name) : nullptr;
 }
 
-/* ── fopen/opendir/scandir hooks ── */
+/* ── fopen/fdopen/opendir/scandir hooks ── */
 static FILE *my_fopen(const char *path, const char *mode) {
     if (is_hidden_path(path)) { errno = ENOENT; return nullptr; }
     if (is_proc_filterable(path)) {
         int memfd = create_filtered_memfd(path);
         if (memfd >= 0) {
-            FILE *fp = fdopen(memfd, mode);
+            FILE *fp = real_fdopen ? real_fdopen(memfd, mode) : fdopen(memfd, mode);
             if (fp) return fp;
             close(memfd);
         }
     }
     return real_fopen ? real_fopen(path, mode) : nullptr;
+}
+
+/* v5.6: fdopen hook — CRITICAL for MagiskDetector bypass.
+ * MagiskDetector uses sys_open (raw syscall, bypasses our openat hook)
+ * then calls fdopen(fd, "r") through PLT. We intercept fdopen, check
+ * what the fd points to via readlinkat, and if it's a filterable proc
+ * file, replace it with a memfd containing pre-filtered content. */
+static FILE *my_fdopen(int fd, const char *mode) {
+    if (g_hidden && fd >= 0) {
+        int kind = check_fd_target(fd);
+        if (kind > 0) {
+            /* This fd points to a filterable /proc file.
+             * Create a memfd with filtered content and use that instead. */
+            char fdpath[64];
+            char link[PATH_MAX];
+            snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", fd);
+            ssize_t n = real_readlink ? real_readlink(fdpath, link, sizeof(link) - 1) : -1;
+            if (n > 0) {
+                link[n] = '\0';
+                int memfd = create_filtered_memfd(link);
+                if (memfd >= 0) {
+                    FILE *fp = real_fdopen ? real_fdopen(memfd, mode) : fdopen(memfd, mode);
+                    if (fp) {
+                        /* Close the original fd — we replaced it with memfd */
+                        close(fd);
+                        return fp;
+                    }
+                    close(memfd);
+                }
+            }
+        }
+    }
+    return real_fdopen ? real_fdopen(fd, mode) : fdopen(fd, mode);
 }
 
 static DIR *my_opendir(const char *path) {
@@ -2226,6 +2260,7 @@ static void register_hooks_for_object(dev_t dev, ino_t ino) {
         {"__system_property_read_callback",(void*)my_prop_read_callback, (void**)&real_prop_read_callback},
         {"__system_property_foreach",    (void*)my_prop_foreach,   (void**)&real_prop_foreach},
         {"fopen",                        (void*)my_fopen,         (void**)&real_fopen},
+    {"fdopen",                       (void*)my_fdopen,        (void**)&real_fdopen},
         {"opendir",                      (void*)my_opendir,       (void**)&real_opendir},
         {"fdopendir",                    (void*)my_fdopendir,     (void**)&real_fdopendir},
         {"scandir",                      (void*)my_scandir,       (void**)&real_scandir},
@@ -2340,6 +2375,7 @@ static void init_real_symbols(void) {
     real_prop_get   = (decltype(real_prop_get))dlsym(RTLD_NEXT, "__system_property_get");
     real_prop_find  = (decltype(real_prop_find))dlsym(RTLD_NEXT, "__system_property_find");
     real_fopen      = (decltype(real_fopen))dlsym(RTLD_NEXT, "fopen");
+    real_fdopen     = (decltype(real_fdopen))dlsym(RTLD_NEXT, "fdopen");
     real_opendir    = (decltype(real_opendir))dlsym(RTLD_NEXT, "opendir");
     real_fdopendir  = (decltype(real_fdopendir))dlsym(RTLD_NEXT, "fdopendir");
     real_scandir    = (decltype(real_scandir))dlsym(RTLD_NEXT, "scandir");

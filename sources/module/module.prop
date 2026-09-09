@@ -1,7 +1,7 @@
 ﻿id=stealth_ultimate
 name=Stealth Ultimate
-version=v5.5
-versionCode=550
+version=v5.6
+versionCode=560
 author=stealth
 description=Universal Zygisk anti-detection: hides root frameworks (Magisk/KernelSU/APatch), Zygisk, LSPosed/Xposed/Riru, Frida, Shamiko, busybox, Play Integrity Fix; spoofs device props, kernel, /proc, SELinux, mounts, maps, environ, net sockets; blocks ptrace, inotify, connect to daemon sockets. Compatible with Zygisk Next and ReZygisk. Targets Native Detector, Ruru, Momo and all standard root checkers.
 minMagisk=26201
