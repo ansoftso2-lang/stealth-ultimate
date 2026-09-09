@@ -350,11 +350,40 @@ static bool should_hide_maps_line(const char *line) {
             return true;
         }
     }
+    /* v5.7: Hide ANY (deleted) executable mapping — not just /dev/zero.
+     * NativeDetector flags all r-xp lines with (deleted) as injection. */
+    if (su_strstr(line, "(deleted)") &&
+        (su_strstr(line, "r-xp") || su_strstr(line, "r-xs"))) {
+        return true;
+    }
     /* v5.2: Hide memfd:jit-cache (Native Detector checks for this) */
     if (su_strstr(line, "memfd:jit-cache")) return true;
     /* Hide anonymous executable mappings */
     if (su_strstr(line, "[anon:") && (su_strstr(line, "r-xp") || su_strstr(line, "r-xs"))) {
         return true;
+    }
+    /* v5.7: Hide purely anonymous r-xp mappings (no pathname).
+     * Format: "addr-addr r-xp offset dev inode" with NO trailing path.
+     * These are injected code pages — legitimate ART JIT has [anon:dalvik-*]. */
+    {
+        const char *perms = su_strstr(line, " r-xp");
+        if (!perms) perms = su_strstr(line, " r-xs");
+        if (perms) {
+            /* Check if there's a pathname after the inode field.
+             * If the line has no '[', no '/', no '(' after the last space,
+             * it's a purely anonymous executable mapping. */
+            const char *last_space = nullptr;
+            for (const char *p = line; *p; p++) {
+                if (*p == ' ') last_space = p;
+            }
+            if (last_space) {
+                const char *path = last_space + 1;
+                /* Empty path or just "0" means no pathname */
+                if (*path == '\0' || (path[0] == '0' && path[1] == '\0')) {
+                    return true;
+                }
+            }
+        }
     }
     static const char *const kP[] = {
         "magisk","/.magisk","ksu","ksud","apatch","apd","KernelSU",
@@ -413,6 +442,30 @@ static bool should_hide_mounts_line(const char *line) {
     };
     for (size_t i = 0; kP[i]; ++i) if (su_strstr(line, kP[i])) return true;
     return false;
+}
+
+/* v5.7: Strip mount propagation flags (shared:N, master:N, propagate_from:N)
+ * from mountinfo lines. These reveal mount namespace isolation to detectors.
+ * Format: "... shared:2 master:4 - type source opts"
+ * We blank the N values to 0 so peer-id-based detection fails. */
+static void strip_mount_peerids(char *buf, size_t len) {
+    if (!buf || len == 0) return;
+    static const char *const kFields[] = {"shared:", "master:", "propagate_from:", nullptr};
+    for (int fi = 0; kFields[fi]; ++fi) {
+        const char *needle = kFields[fi];
+        size_t nlen = strlen(needle);
+        for (size_t i = 0; i + nlen <= len; ) {
+            if (memcmp(buf + i, needle, nlen) == 0) {
+                /* Zero out the number after the colon */
+                size_t j = i + nlen;
+                while (j < len && buf[j] >= '0' && buf[j] <= '9') {
+                    buf[j] = (j == i + nlen) ? '0' : ' ';
+                    j++;
+                }
+                i = j;
+            } else { i++; }
+        }
+    }
 }
 
 static bool should_hide_unix_line(const char *line) {
@@ -1181,6 +1234,10 @@ static int create_filtered_memfd(const char *path) {
             if (nl) line_start = nl + 1; else break;
         }
         total = w;
+        /* v5.7: Strip mount propagation peer ids from mountinfo */
+        if (is_mountinfo) {
+            strip_mount_peerids(buf, total);
+        }
     } else if (is_environ) {
         /* NUL-separated environ entries */
         size_t w = 0;
@@ -1559,6 +1616,8 @@ static ssize_t my_read(int fd, void *buf, size_t count) {
         }
         if (kind == 1) {
             filter_text_lines((char*)buf, (size_t)n);
+            /* v5.7: Strip mount propagation peer ids from mountinfo */
+            strip_mount_peerids((char*)buf, (size_t)n);
             /* v5.1: Also fix device numbers for magic mount detection */
             /* Apply fix_maps_device to each line */
             char *p = (char*)buf;
@@ -1761,6 +1820,50 @@ static long my_syscall(long nr, ...) {
             va_end(ap);
             return my_uname(u);
         }
+#ifdef SYS_getdents64
+        case SYS_getdents64: {
+            unsigned int dfd = va_arg(ap, unsigned int);
+            struct dirent *dirp = va_arg(ap, struct dirent *);
+            unsigned int cnt = va_arg(ap, unsigned int);
+            va_end(ap);
+            int n = real_getdents64 ? real_getdents64(dfd, dirp, cnt) : -1;
+            if (n > 0 && g_hidden) {
+                int w = 0, i = 0;
+                while (i < n) {
+                    struct dirent *de = (struct dirent*)((char*)dirp + i);
+                    if (!is_hidden_name(de->d_name)) {
+                        if (w != i) memmove((char*)dirp + w, (char*)dirp + i, de->d_reclen);
+                        w += de->d_reclen;
+                    }
+                    i += de->d_reclen;
+                }
+                n = w;
+            }
+            return n;
+        }
+#endif
+#ifdef SYS_getdents
+        case SYS_getdents: {
+            unsigned int dfd = va_arg(ap, unsigned int);
+            struct dirent *dirp = va_arg(ap, struct dirent *);
+            unsigned int cnt = va_arg(ap, unsigned int);
+            va_end(ap);
+            int n = real_getdents ? real_getdents(dfd, dirp, cnt) : -1;
+            if (n > 0 && g_hidden) {
+                int w = 0, i = 0;
+                while (i < n) {
+                    struct dirent *de = (struct dirent*)((char*)dirp + i);
+                    if (!is_hidden_name(de->d_name)) {
+                        if (w != i) memmove((char*)dirp + w, (char*)dirp + i, de->d_reclen);
+                        w += de->d_reclen;
+                    }
+                    i += de->d_reclen;
+                }
+                n = w;
+            }
+            return n;
+        }
+#endif
         default: {
             long a1 = va_arg(ap, long), a2 = va_arg(ap, long), a3 = va_arg(ap, long);
             long a4 = va_arg(ap, long), a5 = va_arg(ap, long), a6 = va_arg(ap, long);
