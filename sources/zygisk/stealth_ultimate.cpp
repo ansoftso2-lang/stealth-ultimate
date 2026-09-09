@@ -33,6 +33,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <limits.h>
+#include <stdint.h>
 #include <dlfcn.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -82,6 +83,10 @@
 #define LOGE(...) do {} while (0)
 #define LOGD(...) do {} while (0)
 #endif
+
+/* Magic value passed in arg4 (unused by target syscalls) to bypass
+ * our own seccomp filter. Prevents infinite recursion in SIGSYS handler. */
+#define SU_SECCOMP_MAGIC 0x53555348ULL  /* "SUSH" */
 
 /* ── Real function pointers ── */
 static int            (*real_openat)(int, const char *, int, ...)               = nullptr;
@@ -1108,8 +1113,11 @@ static int create_filtered_memfd(const char *path) {
     if (!is_maps && !is_mountinfo && !is_environ && !is_status && !is_cmdline &&
         !is_stat && !is_attr && !is_cgroup && !is_wchan && !is_filesystems && !is_net && !is_misc_proc) return -1;
 
-    /* Read the real file content */
-    int real_fd = real_openat ? real_openat(AT_FDCWD, path, O_RDONLY, 0) : -1;
+    /* Read the real file content.
+     * Use raw syscall with SU_SECCOMP_MAGIC to bypass our own seccomp filter.
+     * (real_openat calls libc openat which does svc #0, which seccomp traps) */
+    int real_fd = (int)syscall(__NR_openat, AT_FDCWD, path, O_RDONLY, 0,
+                               (long)SU_SECCOMP_MAGIC);
     if (real_fd < 0) return -1;
 
     /* Read entire content into a buffer */
@@ -2465,7 +2473,6 @@ static char *get_process_name(void) {
 #define SU_TRAP_NEWFSTATAT 9
 
 static bool g_seccomp_active = false;
-static int g_seccomp_signalfd = -1;
 
 /* SIGSYS handler — called when a trapped syscall fires */
 static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
@@ -2519,7 +2526,10 @@ static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
     /* Skip syscall if it's not from our filter (shouldn't happen) */
     if (info->si_code != SYS_SECCOMP) return;
 
-    /* Handle each trapped syscall */
+    /* Handle each trapped syscall.
+     * All real syscall() calls pass SU_SECCOMP_MAGIC as arg4 (unused by
+     * these syscalls) so the BPF filter allows them through. */
+    #define SU_MAGIC_ (long)SU_SECCOMP_MAGIC
     switch (syscall_nr) {
     case __NR_openat: {
         int dfd = (int)arg0;
@@ -2535,8 +2545,8 @@ static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
             int memfd = create_filtered_memfd(path);
             if (memfd >= 0) { SET_RET(memfd); return; }
         }
-        /* Perform real syscall */
-        long ret = syscall(__NR_openat, dfd, path, flags, mode);
+        /* Perform real syscall with magic bypass */
+        long ret = syscall(__NR_openat, dfd, path, flags, mode, SU_MAGIC_);
         SET_RET(ret);
         return;
     }
@@ -2546,7 +2556,7 @@ static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
         char *buf = (char*)arg2;
         size_t bufsiz = (size_t)arg3;
         if (path && is_hidden_path(path)) { SET_RET(-ENOENT); return; }
-        long n = syscall(__NR_readlinkat, dirfd, path, buf, bufsiz);
+        long n = syscall(__NR_readlinkat, dirfd, path, buf, bufsiz, SU_MAGIC_);
         if (n > 0) { ssize_t sn = n; filter_readlink_result(buf, &sn); n = sn; }
         SET_RET(n);
         return;
@@ -2555,9 +2565,8 @@ static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
         int fd = (int)arg0;
         struct dirent *dirp = (struct dirent*)arg1;
         unsigned int count = (unsigned int)arg2;
-        long n = syscall(__NR_getdents64, fd, dirp, count);
+        long n = syscall(__NR_getdents64, fd, dirp, count, SU_MAGIC_);
         if (n > 0) {
-            /* Compact the buffer, removing hidden entries */
             long w = 0, i = 0;
             while (i < n) {
                 struct dirent *de = (struct dirent*)((char*)dirp + i);
@@ -2577,7 +2586,7 @@ static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
         const char *path = (const char*)arg0;
         int mode = (int)arg1;
         if (path && is_hidden_path(path)) { SET_RET(-ENOENT); return; }
-        SET_RET(syscall(__NR_access, path, mode));
+        SET_RET(syscall(__NR_access, path, mode, 0, SU_MAGIC_);
         return;
     }
     #endif
@@ -2586,7 +2595,7 @@ static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
         const char *path = (const char*)arg1;
         int mode = (int)arg2;
         if (path && is_hidden_path(path)) { SET_RET(-ENOENT); return; }
-        SET_RET(syscall(__NR_faccessat, dirfd, path, mode, 0));
+        SET_RET(syscall(__NR_faccessat, dirfd, path, mode, 0, SU_MAGIC_);
         return;
     }
     #ifdef __NR_faccessat2
@@ -2596,7 +2605,7 @@ static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
         int mode = (int)arg2;
         int flags = (int)arg3;
         if (path && is_hidden_path(path)) { SET_RET(-ENOENT); return; }
-        SET_RET(syscall(__NR_faccessat2, dirfd, path, mode, flags));
+        SET_RET(syscall(__NR_faccessat2, dirfd, path, mode, flags, SU_MAGIC_);
         return;
     }
     #endif
@@ -2605,18 +2614,18 @@ static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
         const char *path = (const char*)arg0;
         struct stat *buf = (struct stat*)arg1;
         if (path && is_hidden_path(path)) { if (buf) memset(buf, 0, sizeof(*buf)); SET_RET(-ENOENT); return; }
-        SET_RET(syscall(__NR_stat, path, buf));
+        SET_RET(syscall(__NR_stat, path, buf, 0, SU_MAGIC_);
         return;
     }
     #endif
-    #ifdef __NR_newfstatat
+    #if defined(__NR_newfstatat)
     case __NR_newfstatat: {
         int dirfd = (int)arg0;
         const char *path = (const char*)arg1;
         struct stat *buf = (struct stat*)arg2;
         int flags = (int)arg3;
         if (path && is_hidden_path(path)) { if (buf) memset(buf, 0, sizeof(*buf)); SET_RET(-ENOENT); return; }
-        SET_RET(syscall(__NR_newfstatat, dirfd, path, buf, flags));
+        SET_RET(syscall(__NR_newfstatat, dirfd, path, buf, flags, SU_MAGIC_);
         return;
     }
     #elif defined(__NR_fstatat)
@@ -2626,12 +2635,11 @@ static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
         struct stat *buf = (struct stat*)arg2;
         int flags = (int)arg3;
         if (path && is_hidden_path(path)) { if (buf) memset(buf, 0, sizeof(*buf)); SET_RET(-ENOENT); return; }
-        SET_RET(syscall(__NR_fstatat, dirfd, path, buf, flags));
+        SET_RET(syscall(__NR_fstatat, dirfd, path, buf, flags, SU_MAGIC_);
         return;
     }
     #endif
     default:
-        /* Unknown trapped syscall — just allow it */
         return;
     }
 }
@@ -2659,21 +2667,27 @@ static void install_seccomp_filter(void) {
         return;
     }
 
-    /* BPF filter: trap target syscalls, allow everything else.
-     * Note: We don't use sizeof(filter)/sizeof(filter[0]) because
-     * conditional #ifdef inside array initializer breaks sizeof on
-     * some compilers. Instead we count elements explicitly. */
+    /* BPF filter with magic-value bypass to prevent recursion.
+     *
+     * PROBLEM: Our SIGSYS handler calls syscall() which does svc #0,
+     * which seccomp would trap again → infinite recursion → crash.
+     * seccomp filters cannot be removed once installed.
+     *
+     * SOLUTION: The handler passes a magic value in arg4 (unused by
+     * most syscalls). The BPF filter checks args[4]: if it matches
+     * our magic, ALLOW (it's our handler); otherwise TRAP.
+     *
+     * openat(dirfd, path, flags, mode) — arg4 (x4/r8/...) unused
+     * readlinkat(dirfd, path, buf, bufsiz) — arg4 unused
+     * getdents64(fd, dirp, count) — arg4 unused
+     * faccessat(dirfd, path, mode) — arg4 unused
+     * newfstatat(dirfd, path, statbuf, flags) — arg4 unused
+     */
+
     struct sock_filter filter[] = {
-        /* Load syscall number */
-        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
-                 offsetof(struct seccomp_data, nr)),
-        /* Check architecture (only allow native arch) */
+        /* Check architecture first */
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
                  offsetof(struct seccomp_data, arch)),
-        /* On aarch64: AUDIT_ARCH_AARCH64 = 0xC00000B7 */
-        /* On arm: AUDIT_ARCH_ARM = 0x40000028 */
-        /* On x86_64: AUDIT_ARCH_X86_64 = 0xC000003E */
-        /* On i386: AUDIT_ARCH_I386 = 0x40000003 */
     #ifdef __aarch64__
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 1, 0),
     #elif defined(__arm__)
@@ -2688,19 +2702,34 @@ static void install_seccomp_filter(void) {
         /* Wrong arch → kill */
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL),
 
-        /* Reload syscall number */
+        /* Load args[4] (lower 32 bits) and check for magic value.
+         * If it matches → it's our handler calling → ALLOW */
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, args[4])),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                 (uint32_t)SU_SECCOMP_MAGIC, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+
+        /* Also check upper 32 bits of args[4] */
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, args[4]) + 4),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                 (uint32_t)(SU_SECCOMP_MAGIC >> 32), 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+
+        /* Load syscall number */
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
                  offsetof(struct seccomp_data, nr)),
 
-        /* Trap openat — intercept file opens (most critical) */
+        /* Trap openat */
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat, 0, 1),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
 
-        /* Trap readlinkat — intercept symlink reads */
+        /* Trap readlinkat */
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_readlinkat, 0, 1),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
 
-        /* Trap getdents64 — intercept directory listing */
+        /* Trap getdents64 */
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_getdents64, 0, 1),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
 
@@ -2708,7 +2737,6 @@ static void install_seccomp_filter(void) {
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_faccessat, 0, 1),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
 
-        /* Trap newfstatat / fstatat */
     #if defined(__NR_newfstatat)
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_newfstatat, 0, 1),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
@@ -2718,26 +2746,19 @@ static void install_seccomp_filter(void) {
     #endif
 
     #ifdef __NR_access
-        /* Trap access (32-bit only on ARM/x86) */
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_access, 0, 1),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
     #endif
     #ifdef __NR_faccessat2
-        /* Trap faccessat2 (Android 11+) */
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_faccessat2, 0, 1),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
     #endif
     #ifdef __NR_stat
-        /* Trap stat (32-bit only) */
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_stat, 0, 1),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
     #endif
 
-        /* NOTE: read() is NOT trapped to avoid recursion in handler.
-         * Instead, we intercept openat() and return a pre-filtered memfd,
-         * so subsequent read() calls get filtered content automatically. */
-
-        /* Default: allow all other syscalls */
+        /* Default: allow */
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
     };
 

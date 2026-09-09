@@ -5,7 +5,7 @@ SKIPUNZIP=0
 DATA_DIR="/data/adb/su_stealth"
 
 ui_print " ================================"
-ui_print "  Stealth Ultimate v5.4"
+ui_print "  Stealth Ultimate v5.4b"
 ui_print "  Universal Zygisk Anti-Detection"
 ui_print " ================================"
 ui_print ""
