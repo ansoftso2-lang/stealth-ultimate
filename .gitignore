@@ -1,24 +1,5 @@
-# Build artifacts
+_analysis/
+logcat.txt
 *.zip
-*.so
-
-# OS files
-Thumbs.db
-.DS_Store
-
-# IDE
-.vscode/
-.idea/
-
-# Git
-*.orig
-
-# Local secrets
-.github-token
-.env
-.env.*
-!.env.example
-
-# Temporary files
-*.tmp
-*.log
+AGENTS.md
+stealth_ultimate.zip

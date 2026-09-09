@@ -72,7 +72,7 @@
 
 #include "zygisk.hpp"
 
-#define SU_ENABLE_LOG 0
+#define SU_ENABLE_LOG 1
 #if SU_ENABLE_LOG
 #include <android/log.h>
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  "su_mod", __VA_ARGS__)
