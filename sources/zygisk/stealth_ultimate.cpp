@@ -2461,15 +2461,23 @@ public:
          * granted root by MagiskSU. Never hook these or su will break. */
         uint32_t zflags = api->getFlags();
         bool granted_root = (zflags & zygisk::PROCESS_GRANTED_ROOT) != 0;
-        LOGI("flags: granted_root=%d (flags=0x%x)", (int)granted_root, zflags);
+        bool on_denylist = (zflags & zygisk::PROCESS_ON_DENYLIST) != 0;
+        LOGI("flags: granted_root=%d on_denylist=%d (flags=0x%x)", (int)granted_root, (int)on_denylist, zflags);
         if (granted_root) {
             LOGI("skip (root granted) proc=%s", proc);
             return;
         }
+        /* v5.3: Always hook if process needs hiding, regardless of denylist.
+         * The module is loaded by Zygisk into processes on the denylist.
+         * If the app is NOT on the denylist, Zygisk won't even load this module,
+         * so we don't need to check on_denylist here — if we're running, we're in.
+         * However, we call FORCE_DENYLIST_UNMOUNT to ensure Magisk traces are
+         * unmounted even if the process was loaded via a non-standard path. */
         if (!process_needs_hidden(uid, proc)) {
             LOGI("exempt uid=%d proc=%s — no hooks", uid, proc);
             return;
         }
+        LOGI("HOOKING proc=%s uid=%d on_denylist=%d", proc, uid, (int)on_denylist);
         g_hidden = true;
         /* Force unmount Magisk traces in this process */
         api->setOption(zygisk::Option::FORCE_DENYLIST_UNMOUNT);

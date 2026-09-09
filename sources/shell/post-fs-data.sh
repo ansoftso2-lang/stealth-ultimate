@@ -185,3 +185,24 @@ else
 fi
 
 log "=== post-fs-data.sh v8.0 complete ==="
+
+# ── 5. Auto-add root detection apps to Magisk DenyList ──
+# Zygisk ONLY injects modules into processes on the denylist.
+# Without this, our module never loads in the target app → nothing is hidden.
+# Native Detector package: com.drsniffer.detector (Dr-TSNG/NativeDetector)
+DENY_PKGS="com.drsniffer.detector io.github.vvb2060.magiskdetector"
+if [ -x /data/adb/magisk/magisk ]; then
+    for pkg in $DENY_PKGS; do
+        # Check if package is installed before adding
+        if pm list packages 2>/dev/null | grep -q "$pkg"; then
+            magisk --denylist add "$pkg" 2>/dev/null
+            log "denylist: added $pkg"
+        fi
+    done
+    # Also add any installed package with "detector" in the name
+    for pkg in $(pm list packages 2>/dev/null | grep -i 'detect\|root\|magisk\|checker' | sed 's/package://' | cut -d: -f1); do
+        magisk --denylist add "$pkg" 2>/dev/null
+        log "denylist: auto-added $pkg"
+    done
+    log "denylist auto-add complete"
+fi
