@@ -2704,10 +2704,57 @@ static bool process_needs_hidden(int uid, const char *proc) {
         "zygote","zygote64","system_server",
         "magisk","magiskd","ksu","ksud","KernelSU","apatch","apd",
         "shamiko","init","adbd","logd","surfaceflinger",
-        "android.system.server","com.android.systemui", nullptr
+        "android.system.server","com.android.systemui",
+        /* v5.8d: System processes that break if PLT-hooked.
+         * These handle telephony, network, input, media — hooking
+         * read/openat in them causes subtle crashes and slowdowns. */
+        "com.android.phone","com.android.telephony",
+        "com.android.bluetooth","com.android.nfc",
+        "com.android.wifi","com.android.networkstack",
+        "com.android.networkstack.tethering",
+        "com.android.se","com.android.ims","com.android.ims.rcs",
+        "com.android.inputmethod","com.android.inputmethod.pinyin",
+        "com.android.inputmethod.latin","com.google.android.inputmethod",
+        "com.android.providers.contacts","com.android.providers.media",
+        "com.android.providers.telephony","com.android.providers.settings",
+        "com.android.providers.calendar","com.android.providers.downloads",
+        "android.process.media","com.android.media",
+        "com.android.launcher3","com.google.android.apps.nexuslauncher",
+        "com.android.settings","com.android.permissioncontroller",
+        "com.android.shell","com.android.vpndialogs",
+        "com.android.externalstorage","com.android.mtp",
+        "com.android.location.fused","com.android.incallui",
+        "com.android.dialer","com.google.android.dialer",
+        "com.android.contacts","com.google.android.contacts",
+        "com.android.deskclock","com.google.android.deskclock",
+        "com.android.calendar","com.google.android.calendar",
+        "com.android.messaging","com.google.android.apps.messaging",
+        "com.android.cellbroadcastreceiver","com.android.cellbroadcastservice",
+        "com.android.emergency","com.android.hotwordenrollment",
+        "com.android.safetyregulatoryinfo","com.android.traceur",
+        "com.android.localtransport","com.android.printspooler",
+        "com.android.bips","com.android.printservice.recommendation",
+        nullptr
     };
-    for (size_t i = 0; kExempt[i]; ++i) if (su_streq(proc, kExempt[i])) return false;
+    for (size_t i = 0; kExempt[i]; ++i) {
+        if (su_streq(proc, kExempt[i])) return false;
+        /* Match sub-processes: "com.android.phone:foo" but NOT "com.android.phonelocator" */
+        size_t len = strlen(kExempt[i]);
+        if (strncmp(proc, kExempt[i], len) == 0 && proc[len] == ':') return false;
+    }
     if (su_starts(proc, "com.android.systemui:")) return false;
+    /* Google services — these are heavily used and PLT hooks cause GCM/network issues.
+     * Match exact and sub-process (with ':') but not unrelated apps starting with same prefix. */
+    const char * const gGms[] = {
+        "com.google.android.gms", "com.google.android.gsf",
+        "com.android.vending", "com.google.android.googlequicksearchbox",
+        nullptr
+    };
+    for (size_t i = 0; gGms[i]; ++i) {
+        if (su_streq(proc, gGms[i])) return false;
+        size_t len = strlen(gGms[i]);
+        if (strncmp(proc, gGms[i], len) == 0 && proc[len] == ':') return false;
+    }
     return true;
 }
 
