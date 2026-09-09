@@ -59,10 +59,15 @@
 #include <sys/mount.h>
 #include <linux/seccomp.h>
 #include <linux/filter.h>
+#include <linux/bpf_common.h>
 #include <linux/audit.h>
 #include <signal.h>
 #include <ucontext.h>
 #include <asm/unistd.h>
+
+#ifndef SYS_SECCOMP
+#define SYS_SECCOMP 1
+#endif
 
 #include "zygisk.hpp"
 
@@ -2465,11 +2470,13 @@ static int g_seccomp_signalfd = -1;
 /* SIGSYS handler — called when a trapped syscall fires */
 static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
     (void)signum;
-    ucontext_t *uc = (ucontext_t*)ctx;
 
-    /* Get syscall number and arguments from saved registers */
+    /* Get syscall number from siginfo (most portable across architectures) */
+    long syscall_nr = info->si_syscall;
+
+    /* Get arguments from saved registers */
     #ifdef __aarch64__
-    long syscall_nr = uc->uc_mcontext.regs[8];  /* x8 = syscall number */
+    ucontext_t *uc = (ucontext_t*)ctx;
     long arg0 = uc->uc_mcontext.regs[0];
     long arg1 = uc->uc_mcontext.regs[1];
     long arg2 = uc->uc_mcontext.regs[2];
@@ -2478,7 +2485,7 @@ static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
     long arg5 = uc->uc_mcontext.regs[5];
     #define SET_RET(x) uc->uc_mcontext.regs[0] = (long)(x)
     #elif defined(__arm__)
-    long syscall_nr = uc->uc_mcontext.arm_r7;
+    ucontext_t *uc = (ucontext_t*)ctx;
     long arg0 = uc->uc_mcontext.arm_r0;
     long arg1 = uc->uc_mcontext.arm_r1;
     long arg2 = uc->uc_mcontext.arm_r2;
@@ -2487,16 +2494,16 @@ static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
     long arg5 = uc->uc_mcontext.arm_r5;
     #define SET_RET(x) uc->uc_mcontext.arm_r0 = (long)(x)
     #elif defined(__x86_64__)
-    long syscall_nr = uc->uc_mcontext.gregs[REGOrig_rax];
-    long arg0 = uc->uc_mcontext.gregs[REG_rdi];
-    long arg1 = uc->uc_mcontext.gregs[REG_rsi];
-    long arg2 = uc->uc_mcontext.gregs[REG_rdx];
-    long arg3 = uc->uc_mcontext.gregs[REG_r10];
-    long arg4 = uc->uc_mcontext.gregs[REG_r8];
-    long arg5 = uc->uc_mcontext.gregs[REG_r9];
-    #define SET_RET(x) uc->uc_mcontext.gregs[REG_rax] = (long)(x)
+    ucontext_t *uc = (ucontext_t*)ctx;
+    long arg0 = uc->uc_mcontext.gregs[REG_RDI];
+    long arg1 = uc->uc_mcontext.gregs[REG_RSI];
+    long arg2 = uc->uc_mcontext.gregs[REG_RDX];
+    long arg3 = uc->uc_mcontext.gregs[REG_R10];
+    long arg4 = uc->uc_mcontext.gregs[REG_R8];
+    long arg5 = uc->uc_mcontext.gregs[REG_R9];
+    #define SET_RET(x) uc->uc_mcontext.gregs[REG_RAX] = (long)(x)
     #elif defined(__i386__)
-    long syscall_nr = uc->uc_mcontext.gregs[REG_EAX];
+    ucontext_t *uc = (ucontext_t*)ctx;
     long arg0 = uc->uc_mcontext.gregs[REG_EBX];
     long arg1 = uc->uc_mcontext.gregs[REG_ECX];
     long arg2 = uc->uc_mcontext.gregs[REG_EDX];
@@ -2540,7 +2547,7 @@ static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
         size_t bufsiz = (size_t)arg3;
         if (path && is_hidden_path(path)) { SET_RET(-ENOENT); return; }
         long n = syscall(__NR_readlinkat, dirfd, path, buf, bufsiz);
-        if (n > 0) filter_readlink_result(buf, &n);
+        if (n > 0) { ssize_t sn = n; filter_readlink_result(buf, &sn); n = sn; }
         SET_RET(n);
         return;
     }
@@ -2612,6 +2619,16 @@ static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
         SET_RET(syscall(__NR_newfstatat, dirfd, path, buf, flags));
         return;
     }
+    #elif defined(__NR_fstatat)
+    case __NR_fstatat: {
+        int dirfd = (int)arg0;
+        const char *path = (const char*)arg1;
+        struct stat *buf = (struct stat*)arg2;
+        int flags = (int)arg3;
+        if (path && is_hidden_path(path)) { if (buf) memset(buf, 0, sizeof(*buf)); SET_RET(-ENOENT); return; }
+        SET_RET(syscall(__NR_fstatat, dirfd, path, buf, flags));
+        return;
+    }
     #endif
     default:
         /* Unknown trapped syscall — just allow it */
@@ -2642,7 +2659,10 @@ static void install_seccomp_filter(void) {
         return;
     }
 
-    /* BPF filter: trap target syscalls, allow everything else */
+    /* BPF filter: trap target syscalls, allow everything else.
+     * Note: We don't use sizeof(filter)/sizeof(filter[0]) because
+     * conditional #ifdef inside array initializer breaks sizeof on
+     * some compilers. Instead we count elements explicitly. */
     struct sock_filter filter[] = {
         /* Load syscall number */
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
@@ -2688,9 +2708,14 @@ static void install_seccomp_filter(void) {
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_faccessat, 0, 1),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
 
-        /* Trap newfstatat */
+        /* Trap newfstatat / fstatat */
+    #if defined(__NR_newfstatat)
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_newfstatat, 0, 1),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+    #elif defined(__NR_fstatat)
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_fstatat, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+    #endif
 
     #ifdef __NR_access
         /* Trap access (32-bit only on ARM/x86) */
@@ -2716,10 +2741,9 @@ static void install_seccomp_filter(void) {
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
     };
 
-    struct sock_fprog prog = {
-        .len = sizeof(filter) / sizeof(filter[0]),
-        .filter = filter,
-    };
+    struct sock_fprog prog;
+    prog.filter = filter;
+    prog.len = (unsigned short)(sizeof(filter) / sizeof(struct sock_filter));
 
     if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog, 0, 0) != 0) {
         LOGE("prctl(PR_SET_SECCOMP) failed: %d", errno);
