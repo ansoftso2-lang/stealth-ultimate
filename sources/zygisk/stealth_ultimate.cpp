@@ -69,6 +69,12 @@
 #ifndef SYS_SECCOMP
 #define SYS_SECCOMP 1
 #endif
+#ifndef SECCOMP_SET_MODE_FILTER
+#define SECCOMP_SET_MODE_FILTER 1
+#endif
+#ifndef SECCOMP_FILTER_FLAG_TSYNC
+#define SECCOMP_FILTER_FLAG_TSYNC 1
+#endif
 
 #include "zygisk.hpp"
 
@@ -95,7 +101,10 @@
 
 /* Magic value passed in arg4 (unused by target syscalls) to bypass
  * our own seccomp filter. Prevents infinite recursion in SIGSYS handler. */
-#define SU_SECCOMP_MAGIC 0x53555348ULL  /* "SUSH" */
+#define SU_SECCOMP_MAGIC 0x53555348ULL  /* "SUSH" — 32-bit magic value */
+
+/* v5.8c: Seccomp active flag — must be visible before functions that check it */
+static bool g_seccomp_active = false;
 
 /* ── Real function pointers ── */
 static int            (*real_openat)(int, const char *, int, ...)               = nullptr;
@@ -844,7 +853,14 @@ static int check_fd_target(int fd) {
     char link[64];
     char target[PATH_MAX];
     snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
-    ssize_t n = real_readlinkat ? real_readlinkat(AT_FDCWD, link, target, sizeof(target) - 1) : -1;
+    /* v5.8c: Use raw syscall with magic bypass when seccomp is active,
+     * to avoid infinite recursion (real_readlinkat → svc #0 → seccomp trap). */
+    ssize_t n;
+    if (g_seccomp_active) {
+        n = syscall(__NR_readlinkat, AT_FDCWD, link, target, sizeof(target) - 1, 0, (long)SU_SECCOMP_MAGIC);
+    } else {
+        n = real_readlinkat ? real_readlinkat(AT_FDCWD, link, target, sizeof(target) - 1) : -1;
+    }
     if (n <= 0) return 0;
     target[n] = '\0';
     /* Check if it's a filterable proc file */
@@ -1024,7 +1040,13 @@ static int fd_filter_kind(int fd) {
     char fdpath[64];
     char link[PATH_MAX];
     snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", fd);
-    ssize_t n = real_readlink ? real_readlink(fdpath, link, sizeof(link) - 1) : -1;
+    /* v5.8c: Use raw syscall with magic bypass when seccomp is active */
+    ssize_t n;
+    if (g_seccomp_active) {
+        n = syscall(__NR_readlink, fdpath, link, sizeof(link) - 1, 0, 0, (long)SU_SECCOMP_MAGIC);
+    } else {
+        n = real_readlink ? real_readlink(fdpath, link, sizeof(link) - 1) : -1;
+    }
     if (n <= 0) { fd_cache_set(fd, 0); return 0; }
     link[n] = '\0';
     int kind = 0;
@@ -1216,8 +1238,15 @@ static int create_filtered_memfd(const char *path) {
     if (!is_maps && !is_mountinfo && !is_environ && !is_status && !is_cmdline &&
         !is_stat && !is_attr && !is_cgroup && !is_wchan && !is_filesystems && !is_net && !is_misc_proc) return -1;
 
-    /* Read the real file content */
-    int real_fd = real_openat ? real_openat(AT_FDCWD, path, O_RDONLY, 0) : -1;
+    /* Read the real file content.
+     * v5.8c: Use raw syscall with magic bypass when seccomp is active,
+     * to avoid recursion (real_openat/real_read → svc #0 → seccomp trap). */
+    int real_fd;
+    if (g_seccomp_active) {
+        real_fd = syscall(__NR_openat, AT_FDCWD, path, O_RDONLY, 0, (long)SU_SECCOMP_MAGIC);
+    } else {
+        real_fd = real_openat ? real_openat(AT_FDCWD, path, O_RDONLY, 0) : -1;
+    }
     if (real_fd < 0) return -1;
 
     /* Read entire content into a buffer */
@@ -1225,8 +1254,13 @@ static int create_filtered_memfd(const char *path) {
     if (!buf) { close(real_fd); return -1; }
     size_t total = 0;
     ssize_t n;
-    while (total < 1024 * 1024 - 1 &&
-           (n = real_read ? real_read(real_fd, buf + total, 1024 * 1024 - 1 - total) : -1) > 0) {
+    while (total < 1024 * 1024 - 1) {
+        if (g_seccomp_active) {
+            n = syscall(__NR_read, real_fd, buf + total, 1024 * 1024 - 1 - total, 0, (long)SU_SECCOMP_MAGIC);
+        } else {
+            n = real_read ? real_read(real_fd, buf + total, 1024 * 1024 - 1 - total) : -1;
+        }
+        if (n <= 0) break;
         total += (size_t)n;
     }
     close(real_fd);
@@ -2693,8 +2727,6 @@ static char *get_process_name(void) {
 #define SU_TRAP_STAT       8
 #define SU_TRAP_NEWFSTATAT 9
 
-static bool g_seccomp_active = false;
-
 /* SIGSYS handler — called when a trapped syscall fires */
 static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
     (void)signum;
@@ -2964,19 +2996,15 @@ static void install_seccomp_filter(void) {
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL),
 
         /* Load args[4] (lower 32 bits) and check for magic value.
-         * If it matches → it's our handler calling → ALLOW */
+         * v5.8c: Only check lower 32 bits. SU_SECCOMP_MAGIC = 0x53555348
+         * which fits in 32 bits (upper = 0 on both 32-bit and 64-bit).
+         * Previous code checked upper separately with OR, which falsely
+         * allowed any syscall with args[4]=0 (since upper >> 32 == 0). */
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
                  offsetof(struct seccomp_data, args[4])),
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
-                 (uint32_t)SU_SECCOMP_MAGIC, 0, 1),
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
-
-        /* Also check upper 32 bits of args[4] */
-        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
-                 offsetof(struct seccomp_data, args[4]) + 4),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
-                 (uint32_t)(SU_SECCOMP_MAGIC >> 32), 0, 1),
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+                 (uint32_t)SU_SECCOMP_MAGIC, 0, 1),  /* lower match? */
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),  /* match → ALLOW */
 
         /* Load syscall number */
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
