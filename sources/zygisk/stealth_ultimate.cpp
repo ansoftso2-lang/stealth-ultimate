@@ -2769,6 +2769,40 @@ static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
         SET_RET(ret);
         return;
     }
+    case __NR_read: {
+        int fd = (int)arg0;
+        void *buf = (void*)arg1;
+        size_t count = (size_t)arg2;
+        if (!buf || count == 0) { SET_RET(0); return; }
+        long n = syscall(__NR_read, fd, buf, count, su_magic);
+        if (n > 0) {
+            int kind = fd_filter_kind(fd);
+            if (kind == 0) kind = check_fd_target(fd);
+            if (kind == 1) {
+                filter_text_lines((char*)buf, (size_t)n);
+                strip_mount_peerids((char*)buf, (size_t)n);
+            }
+            else if (kind == 2) patch_tracerpid((char*)buf, (size_t)n);
+            else if (kind == 3) filter_environ((char*)buf, (size_t)n);
+            else if (kind == 4) patch_cmdline((char*)buf, (size_t)n);
+            else if (kind == 6) {
+                if (su_strstr((char*)buf, "magisk") || su_strstr((char*)buf, "su:s0") ||
+                    su_strstr((char*)buf, "root:s0") || su_strstr((char*)buf, "shell:s0")) {
+                    const char *safe = "u:r:untrusted_app:s0";
+                    size_t slen = strlen(safe);
+                    if (slen <= (size_t)n) {
+                        memcpy(buf, safe, slen);
+                        memset((char*)buf + slen, 0, (size_t)n - slen);
+                        n = slen;
+                    }
+                }
+            }
+            else if (kind == 7) filter_text_lines((char*)buf, (size_t)n);
+            else if (kind == 8) { memset(buf, 0, (size_t)n); n = 0; }
+        }
+        SET_RET(n);
+        return;
+    }
     case __NR_readlinkat: {
         int dirfd = (int)arg0;
         const char *path = (const char*)arg1;
@@ -2944,6 +2978,12 @@ static void install_seccomp_filter(void) {
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat, 0, 1),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
 
+        /* v5.8: Trap read — for raw-syscall bypass of /proc/self/maps filtering.
+         * The handler checks fd target and only filters if it's a proc file.
+         * All other reads pass through with magic bypass. */
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_read, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+
         /* Trap readlinkat */
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_readlinkat, 0, 1),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
@@ -2992,6 +3032,71 @@ static void install_seccomp_filter(void) {
 
     g_seccomp_active = true;
     LOGI("seccomp BPF installed — trapping raw syscalls (openat, read, readlinkat, getdents64, faccessat, newfstatat)");
+}
+
+/* v5.8: Manually unmount Magisk/Zygisk/module traces from mount namespace.
+ * Called after unshare(CLONE_NEWNS) in postAppSpecialize.
+ * Reads /proc/self/mountinfo, finds suspicious mounts, and umount2() them.
+ * This ensures raw syscalls see a clean mountinfo. */
+static void do_manual_unmount(void) {
+    /* Use real_openat to bypass our own hooks */
+    int fd = real_openat ? real_openat(AT_FDCWD, "/proc/self/mountinfo", O_RDONLY, 0) : -1;
+    if (fd < 0) fd = open("/proc/self/mountinfo", O_RDONLY);
+    if (fd < 0) return;
+
+    char buf[65536];
+    ssize_t total = 0;
+    while (total < (ssize_t)sizeof(buf) - 1) {
+        ssize_t n = real_read ? real_read(fd, buf + total, sizeof(buf) - 1 - total) : -1;
+        if (n <= 0) break;
+        total += n;
+    }
+    close(fd);
+    buf[total] = '\0';
+
+    /* Parse mountinfo lines. Format:
+     * 36 35 98:0 /system/bin/webview_zygote /system/bin/webview_zygote ...
+     * The mount point is field 5 (0-indexed: fields are space-separated,
+     * field 0=mount ID, 1=parent ID, 2=major:minor, 3=root, 4=mount point, ...) */
+    int unmounted = 0;
+    char *line = buf;
+    while (line < buf + total) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        if (*line) {
+            /* Extract mount point (field 5) */
+            char *p = line;
+            int field = 0;
+            char *mount_point = nullptr;
+            while (*p && field < 5) {
+                if (*p == ' ') {
+                    field++;
+                    while (*p == ' ') p++;
+                } else {
+                    p++;
+                }
+            }
+            if (field == 4) mount_point = p;
+            /* Find end of mount point field */
+            if (mount_point) {
+                char *mp_end = strchr(mount_point, ' ');
+                if (mp_end) *mp_end = '\0';
+            }
+
+            if (mount_point && should_hide_mounts_line(line)) {
+                /* Unmount this mount point */
+                if (umount2(mount_point, MNT_DETACH) == 0) {
+                    unmounted++;
+                    LOGI("unmounted: %s", mount_point);
+                }
+            }
+        }
+        if (!nl) break;
+        line = nl + 1;
+    }
+    if (unmounted > 0) {
+        LOGI("manual unmount: removed %d suspicious mounts", unmounted);
+    }
 }
 
 class StealthModule : public zygisk::ModuleBase {
@@ -3096,21 +3201,24 @@ public:
         LOGI("solist cleanup done");
     }
     void postAppSpecialize(const zygisk::AppSpecializeArgs *) override {
-        /* v5.4b: seccomp BPF removed — it is COUNTERPRODUCTIVE.
+        if (!g_hidden) return;
+
+        /* v5.8: Manually unmount Magisk/Zygisk/module traces from our mount namespace.
+         * FORCE_DENYLIST_UNMOUNT only works for denylisted apps, but we removed
+         * reveny from denylist so the module could load. We must unmount manually. */
+        do_manual_unmount();
+
+        /* v5.8: Re-enable seccomp BPF to trap raw syscalls (svc #0).
+         * Native Detector bypasses PLT hooks by using inline assembly syscalls.
+         * Seccomp is the ONLY userspace mechanism that can intercept raw syscalls.
          *
-         * Reasons:
-         * 1. MagiskDetector checks prctl(PR_GET_SECCOMP) and /proc/self/status
-         *    Seccomp field → installing a filter ADDS a detection vector.
-         * 2. seccomp traps ALL openat/getdents64/etc in the entire process,
-         *    including ART, binder, Android runtime → crash risk + perf hit.
-         * 3. seccomp filters cannot be removed once installed → permanent.
-         *
-         * Instead, we rely on:
-         * - PLT hooks for all libc-based syscalls (covers NativeDetector)
-         * - FORCE_DENYLIST_UNMOUNT to clean kernel view (covers raw syscalls)
-         *   When Magisk unmounts its traces, even raw svc #0 sees clean state.
-         * - /proc/self/status filtering to hide Seccomp/TracerPid fields
+         * Detection vectors from seccomp itself are handled by:
+         * - prctl hook: PR_GET_SECCOMP returns 0
+         * - /proc/self/status filtering: Seccomp field patched to 0
+         * - NoNewPrivs patched to 0 in status
          */
+        install_seccomp_filter();
+        LOGI("seccomp BPF installed (v5.8) — raw syscalls trapped");
     }
     /* Do NOT hook system_server — it breaks mount namespace for all forks
      * and causes root access issues in child processes. */
