@@ -84,10 +84,12 @@
 #include <android/log.h>
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  "su_mod", __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "su_mod", __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  "su_mod", __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "su_mod", __VA_ARGS__)
 #else
 #define LOGI(...) do {} while (0)
 #define LOGE(...) do {} while (0)
+#define LOGW(...) do {} while (0)
 #define LOGD(...) do {} while (0)
 #endif
 
@@ -2774,7 +2776,9 @@ static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
         void *buf = (void*)arg1;
         size_t count = (size_t)arg2;
         if (!buf || count == 0) { SET_RET(0); return; }
-        long n = syscall(__NR_read, fd, buf, count, su_magic);
+        /* v5.8c: pass su_magic as 5th arg (args[4]) for BPF bypass.
+         * read has 3 real args, so we pad arg3 with 0. */
+        long n = syscall(__NR_read, fd, buf, count, 0, su_magic);
         if (n > 0) {
             int kind = fd_filter_kind(fd);
             if (kind == 0) kind = check_fd_target(fd);
@@ -2818,7 +2822,8 @@ static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
         int fd = (int)arg0;
         struct dirent *dirp = (struct dirent*)arg1;
         unsigned int count = (unsigned int)arg2;
-        long n = syscall(__NR_getdents64, fd, dirp, count, su_magic);
+        /* v5.8c: pad arg3 with 0, magic in arg4 */
+        long n = syscall(__NR_getdents64, fd, dirp, count, 0, su_magic);
         if (n > 0) {
             long w = 0, i = 0;
             while (i < n) {
@@ -2839,7 +2844,8 @@ static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
         const char *path = (const char*)arg0;
         int mode = (int)arg1;
         if (path && is_hidden_path(path)) { SET_RET(-ENOENT); return; }
-        SET_RET(syscall(__NR_access, path, mode, 0, su_magic));
+        /* v5.8c: pad arg2,arg3 with 0, magic in arg4 */
+        SET_RET(syscall(__NR_access, path, mode, 0, 0, su_magic));
         return;
     }
     #endif
@@ -2848,6 +2854,7 @@ static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
         const char *path = (const char*)arg1;
         int mode = (int)arg2;
         if (path && is_hidden_path(path)) { SET_RET(-ENOENT); return; }
+        /* v5.8c: faccessat has 3 real args (some kernels have 4), pad to put magic in arg4 */
         SET_RET(syscall(__NR_faccessat, dirfd, path, mode, 0, su_magic));
         return;
     }
@@ -2867,7 +2874,8 @@ static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
         const char *path = (const char*)arg0;
         struct stat *buf = (struct stat*)arg1;
         if (path && is_hidden_path(path)) { if (buf) memset(buf, 0, sizeof(*buf)); SET_RET(-ENOENT); return; }
-        SET_RET(syscall(__NR_stat, path, buf, 0, su_magic));
+        /* v5.8c: pad arg2,arg3 with 0, magic in arg4 */
+        SET_RET(syscall(__NR_stat, path, buf, 0, 0, su_magic));
         return;
     }
     #endif
@@ -3025,9 +3033,26 @@ static void install_seccomp_filter(void) {
     prog.filter = filter;
     prog.len = (unsigned short)(sizeof(filter) / sizeof(struct sock_filter));
 
-    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog, 0, 0) != 0) {
-        LOGE("prctl(PR_SET_SECCOMP) failed: %d", errno);
-        return;
+    /* v5.8c: Use seccomp() syscall with SECCOMP_FILTER_FLAG_TSYNC to apply
+     * the filter to ALL threads in the process, not just the current thread.
+     * prctl(PR_SET_SECCOMP) only affects the calling thread — detector worker
+     * threads would bypass the filter. */
+    int ret = -1;
+#ifdef __NR_seccomp
+    ret = syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER,
+                  SECCOMP_FILTER_FLAG_TSYNC, &prog);
+    if (ret != 0) {
+        LOGE("seccomp(TSYNC) failed: %d (errno=%d), trying prctl fallback", ret, errno);
+        ret = -1;
+    }
+#endif
+    if (ret != 0) {
+        /* Fallback: prctl (single-thread only) */
+        if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog, 0, 0) != 0) {
+            LOGE("prctl(PR_SET_SECCOMP) failed: errno=%d", errno);
+            return;
+        }
+        LOGW("seccomp installed via prctl (single-thread only — TSYNC unavailable)");
     }
 
     g_seccomp_active = true;
