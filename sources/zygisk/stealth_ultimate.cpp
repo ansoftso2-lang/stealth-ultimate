@@ -857,7 +857,7 @@ static int check_fd_target(int fd) {
      * to avoid infinite recursion (real_readlinkat → svc #0 → seccomp trap). */
     ssize_t n;
     if (g_seccomp_active) {
-        n = syscall(__NR_readlinkat, AT_FDCWD, link, target, sizeof(target) - 1, 0, (long)SU_SECCOMP_MAGIC);
+        n = syscall(__NR_readlinkat, AT_FDCWD, link, target, sizeof(target) - 1, (long)SU_SECCOMP_MAGIC);
     } else {
         n = real_readlinkat ? real_readlinkat(AT_FDCWD, link, target, sizeof(target) - 1) : -1;
     }
@@ -1040,10 +1040,11 @@ static int fd_filter_kind(int fd) {
     char fdpath[64];
     char link[PATH_MAX];
     snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", fd);
-    /* v5.8c: Use raw syscall with magic bypass when seccomp is active */
+    /* v5.8c: Use readlinkat with magic bypass when seccomp is active.
+     * __NR_readlink doesn't exist on ARM64 — only readlinkat. */
     ssize_t n;
     if (g_seccomp_active) {
-        n = syscall(__NR_readlink, fdpath, link, sizeof(link) - 1, 0, 0, (long)SU_SECCOMP_MAGIC);
+        n = syscall(__NR_readlinkat, AT_FDCWD, fdpath, link, sizeof(link) - 1, (long)SU_SECCOMP_MAGIC);
     } else {
         n = real_readlink ? real_readlink(fdpath, link, sizeof(link) - 1) : -1;
     }
