@@ -467,6 +467,29 @@ static bool should_hide_mounts_line(const char *line) {
     return false;
 }
 
+/* v5.8c: Strict check for which mounts to ACTUALLY umount2().
+ * should_hide_mounts_line() is too broad (matches "overlay", "/dev/block/dm-",
+ * "com.android.art") — using it for umount would detach system partitions
+ * and crash the launcher / network / ART. This function only matches
+ * Magisk/Zygisk/module-specific mount points that are safe to detach. */
+static bool should_unmount_line(const char *line) {
+    if (!line) return false;
+    /* Only match mounts that are clearly root/Zygisk/module related */
+    static const char *const kU[] = {
+        "/data/adb","/sbin/.magisk","/debug_ramdisk",
+        "magisk","/data/adb/mirror","/sbin/.mirror",
+        "magisk-mirror","libzygisk.so",
+        "zygisksu","zygiskd","rezygisk","zygisk_next",
+        "tmpfs /data/adb","tmpfs /debug_ramdisk",
+        "tmpfs /dev/__magisk","tmpfs /sbin",
+        "magisk.img","ksu.img",
+        "/data/adb/modules",
+        nullptr
+    };
+    for (size_t i = 0; kU[i]; ++i) if (su_strstr(line, kU[i])) return true;
+    return false;
+}
+
 /* v5.7: Strip mount propagation flags (shared:N, master:N, propagate_from:N)
  * from mountinfo lines. These reveal mount namespace isolation to detectors.
  * Format: "... shared:2 master:4 - type source opts"
@@ -3137,7 +3160,7 @@ static void do_manual_unmount(void) {
                 if (mp_end) *mp_end = '\0';
             }
 
-            if (mount_point && should_hide_mounts_line(line)) {
+            if (mount_point && should_unmount_line(line)) {
                 /* Unmount this mount point */
                 if (umount2(mount_point, MNT_DETACH) == 0) {
                     unmounted++;
@@ -3156,6 +3179,7 @@ static void do_manual_unmount(void) {
 class StealthModule : public zygisk::ModuleBase {
     zygisk::Api *api = nullptr;
     JNIEnv *env = nullptr;
+    char m_proc_name[256] = {};  /* saved process name from preAppSpecialize */
 public:
     void onLoad(zygisk::Api *a, JNIEnv *e) override {
         api = a; g_api = a; env = e;
@@ -3179,6 +3203,8 @@ public:
             }
         }
         const char *proc = procbuf[0] ? procbuf : "unknown";
+        /* Save for postAppSpecialize */
+        strncpy(m_proc_name, proc, sizeof(m_proc_name) - 1);
         LOGI("preAppSpecialize: uid=%d proc=%s", uid, proc);
 
         /* Check Zygisk flags: PROCESS_GRANTED_ROOT means this process has been
@@ -3262,17 +3288,18 @@ public:
          * reveny from denylist so the module could load. We must unmount manually. */
         do_manual_unmount();
 
-        /* v5.8: Re-enable seccomp BPF to trap raw syscalls (svc #0).
-         * Native Detector bypasses PLT hooks by using inline assembly syscalls.
-         * Seccomp is the ONLY userspace mechanism that can intercept raw syscalls.
-         *
-         * Detection vectors from seccomp itself are handled by:
-         * - prctl hook: PR_GET_SECCOMP returns 0
-         * - /proc/self/status filtering: Seccomp field patched to 0
-         * - NoNewPrivs patched to 0 in status
-         */
+        /* v5.8c: Seccomp BPF is DANGEROUS — it traps ALL read() calls in the
+         * process, adding SIGSYS handler overhead to every single read.
+         * Installing it in launcher/network/system apps causes crashes and
+         * boot loops. Only install for the specific detector app that uses
+         * raw syscalls (svc #0) to bypass PLT hooks. */
+        if (!m_proc_name[0] || !su_streq(m_proc_name, "com.reveny.nativecheck")) {
+            LOGI("seccomp: skipped for proc=%s (not nativecheck)", m_proc_name);
+            return;
+        }
+
         install_seccomp_filter();
-        LOGI("seccomp BPF installed (v5.8) — raw syscalls trapped");
+        LOGI("seccomp BPF installed for com.reveny.nativecheck — raw syscalls trapped");
     }
     /* Do NOT hook system_server — it breaks mount namespace for all forks
      * and causes root access issues in child processes. */
