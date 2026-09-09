@@ -57,6 +57,12 @@
 #include <poll.h>
 #include <sched.h>
 #include <sys/mount.h>
+#include <linux/seccomp.h>
+#include <linux/filter.h>
+#include <linux/audit.h>
+#include <signal.h>
+#include <ucontext.h>
+#include <asm/unistd.h>
 
 #include "zygisk.hpp"
 
@@ -2429,6 +2435,301 @@ static char *get_process_name(void) {
     return proc;
 }
 
+/* ── v5.4: seccomp BPF trap for raw syscalls ──
+ *
+ * vvb2060/MagiskDetector uses linux_syscall_support.h which makes raw
+ * syscalls via inline asm (svc #0), bypassing ALL PLT hooks.
+ *
+ * The ONLY way to intercept raw syscalls from userspace is seccomp BPF
+ * with SECCOMP_RET_TRAP. This causes the kernel to send SIGSYS when a
+ * trapped syscall is invoked, even if it's a raw svc instruction.
+ *
+ * Our SIGSYS handler reads the syscall arguments, performs the real
+ * syscall via libc, applies filtering, and sets the return value.
+ */
+
+/* Syscalls we trap — these are the ones detectors use to scan files */
+#define SU_TRAP_OPENAT     1
+#define SU_TRAP_READ       2
+#define SU_TRAP_READLINKAT 3
+#define SU_TRAP_GETDENTS64 4
+#define SU_TRAP_ACCESS     5
+#define SU_TRAP_FACCESSAT  6
+#define SU_TRAP_FACCESSAT2 7
+#define SU_TRAP_STAT       8
+#define SU_TRAP_NEWFSTATAT 9
+
+static bool g_seccomp_active = false;
+static int g_seccomp_signalfd = -1;
+
+/* SIGSYS handler — called when a trapped syscall fires */
+static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
+    (void)signum;
+    ucontext_t *uc = (ucontext_t*)ctx;
+
+    /* Get syscall number and arguments from saved registers */
+    #ifdef __aarch64__
+    long syscall_nr = uc->uc_mcontext.regs[8];  /* x8 = syscall number */
+    long arg0 = uc->uc_mcontext.regs[0];
+    long arg1 = uc->uc_mcontext.regs[1];
+    long arg2 = uc->uc_mcontext.regs[2];
+    long arg3 = uc->uc_mcontext.regs[3];
+    long arg4 = uc->uc_mcontext.regs[4];
+    long arg5 = uc->uc_mcontext.regs[5];
+    #define SET_RET(x) uc->uc_mcontext.regs[0] = (long)(x)
+    #elif defined(__arm__)
+    long syscall_nr = uc->uc_mcontext.arm_r7;
+    long arg0 = uc->uc_mcontext.arm_r0;
+    long arg1 = uc->uc_mcontext.arm_r1;
+    long arg2 = uc->uc_mcontext.arm_r2;
+    long arg3 = uc->uc_mcontext.arm_r3;
+    long arg4 = uc->uc_mcontext.arm_r4;
+    long arg5 = uc->uc_mcontext.arm_r5;
+    #define SET_RET(x) uc->uc_mcontext.arm_r0 = (long)(x)
+    #elif defined(__x86_64__)
+    long syscall_nr = uc->uc_mcontext.gregs[REGOrig_rax];
+    long arg0 = uc->uc_mcontext.gregs[REG_rdi];
+    long arg1 = uc->uc_mcontext.gregs[REG_rsi];
+    long arg2 = uc->uc_mcontext.gregs[REG_rdx];
+    long arg3 = uc->uc_mcontext.gregs[REG_r10];
+    long arg4 = uc->uc_mcontext.gregs[REG_r8];
+    long arg5 = uc->uc_mcontext.gregs[REG_r9];
+    #define SET_RET(x) uc->uc_mcontext.gregs[REG_rax] = (long)(x)
+    #elif defined(__i386__)
+    long syscall_nr = uc->uc_mcontext.gregs[REG_EAX];
+    long arg0 = uc->uc_mcontext.gregs[REG_EBX];
+    long arg1 = uc->uc_mcontext.gregs[REG_ECX];
+    long arg2 = uc->uc_mcontext.gregs[REG_EDX];
+    long arg3 = uc->uc_mcontext.gregs[REG_ESI];
+    long arg4 = uc->uc_mcontext.gregs[REG_EDI];
+    long arg5 = uc->uc_mcontext.gregs[REG_EBP];
+    #define SET_RET(x) uc->uc_mcontext.gregs[REG_EAX] = (long)(x)
+    #else
+    /* Unsupported architecture — just allow */
+    return;
+    #endif
+
+    /* Skip syscall if it's not from our filter (shouldn't happen) */
+    if (info->si_code != SYS_SECCOMP) return;
+
+    /* Handle each trapped syscall */
+    switch (syscall_nr) {
+    case __NR_openat: {
+        int dfd = (int)arg0;
+        const char *path = (const char*)arg1;
+        int flags = (int)arg2;
+        mode_t mode = (mode_t)arg3;
+
+        if (path && is_hidden_path(path)) {
+            SET_RET(-ENOENT);
+            return;
+        }
+        if (path && is_proc_filterable(path)) {
+            int memfd = create_filtered_memfd(path);
+            if (memfd >= 0) { SET_RET(memfd); return; }
+        }
+        /* Perform real syscall */
+        long ret = syscall(__NR_openat, dfd, path, flags, mode);
+        SET_RET(ret);
+        return;
+    }
+    case __NR_readlinkat: {
+        int dirfd = (int)arg0;
+        const char *path = (const char*)arg1;
+        char *buf = (char*)arg2;
+        size_t bufsiz = (size_t)arg3;
+        if (path && is_hidden_path(path)) { SET_RET(-ENOENT); return; }
+        long n = syscall(__NR_readlinkat, dirfd, path, buf, bufsiz);
+        if (n > 0) filter_readlink_result(buf, &n);
+        SET_RET(n);
+        return;
+    }
+    case __NR_getdents64: {
+        int fd = (int)arg0;
+        struct dirent *dirp = (struct dirent*)arg1;
+        unsigned int count = (unsigned int)arg2;
+        long n = syscall(__NR_getdents64, fd, dirp, count);
+        if (n > 0) {
+            /* Compact the buffer, removing hidden entries */
+            long w = 0, i = 0;
+            while (i < n) {
+                struct dirent *de = (struct dirent*)((char*)dirp + i);
+                if (!is_hidden_name(de->d_name)) {
+                    if (w != i) memmove((char*)dirp + w, (char*)dirp + i, de->d_reclen);
+                    w += de->d_reclen;
+                }
+                i += de->d_reclen;
+            }
+            n = w;
+        }
+        SET_RET(n);
+        return;
+    }
+    #ifdef __NR_access
+    case __NR_access: {
+        const char *path = (const char*)arg0;
+        int mode = (int)arg1;
+        if (path && is_hidden_path(path)) { SET_RET(-ENOENT); return; }
+        SET_RET(syscall(__NR_access, path, mode));
+        return;
+    }
+    #endif
+    case __NR_faccessat: {
+        int dirfd = (int)arg0;
+        const char *path = (const char*)arg1;
+        int mode = (int)arg2;
+        if (path && is_hidden_path(path)) { SET_RET(-ENOENT); return; }
+        SET_RET(syscall(__NR_faccessat, dirfd, path, mode, 0));
+        return;
+    }
+    #ifdef __NR_faccessat2
+    case __NR_faccessat2: {
+        int dirfd = (int)arg0;
+        const char *path = (const char*)arg1;
+        int mode = (int)arg2;
+        int flags = (int)arg3;
+        if (path && is_hidden_path(path)) { SET_RET(-ENOENT); return; }
+        SET_RET(syscall(__NR_faccessat2, dirfd, path, mode, flags));
+        return;
+    }
+    #endif
+    #ifdef __NR_stat
+    case __NR_stat: {
+        const char *path = (const char*)arg0;
+        struct stat *buf = (struct stat*)arg1;
+        if (path && is_hidden_path(path)) { if (buf) memset(buf, 0, sizeof(*buf)); SET_RET(-ENOENT); return; }
+        SET_RET(syscall(__NR_stat, path, buf));
+        return;
+    }
+    #endif
+    #ifdef __NR_newfstatat
+    case __NR_newfstatat: {
+        int dirfd = (int)arg0;
+        const char *path = (const char*)arg1;
+        struct stat *buf = (struct stat*)arg2;
+        int flags = (int)arg3;
+        if (path && is_hidden_path(path)) { if (buf) memset(buf, 0, sizeof(*buf)); SET_RET(-ENOENT); return; }
+        SET_RET(syscall(__NR_newfstatat, dirfd, path, buf, flags));
+        return;
+    }
+    #endif
+    default:
+        /* Unknown trapped syscall — just allow it */
+        return;
+    }
+}
+
+/* Install seccomp BPF filter that traps key syscalls */
+static void install_seccomp_filter(void) {
+    /* Only install once */
+    if (g_seccomp_active) return;
+
+    /* Install SIGSYS handler first */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = su_sigsys_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGSYS, &sa, nullptr) != 0) {
+        LOGE("sigaction(SIGSYS) failed: %d", errno);
+        return;
+    }
+
+    /* Allow our own process to invoke syscalls that we trap
+     * (the handler uses syscall() which would also be trapped) */
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+        LOGE("prctl(PR_SET_NO_NEW_PRIVS) failed: %d", errno);
+        return;
+    }
+
+    /* BPF filter: trap target syscalls, allow everything else */
+    struct sock_filter filter[] = {
+        /* Load syscall number */
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+        /* Check architecture (only allow native arch) */
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, arch)),
+        /* On aarch64: AUDIT_ARCH_AARCH64 = 0xC00000B7 */
+        /* On arm: AUDIT_ARCH_ARM = 0x40000028 */
+        /* On x86_64: AUDIT_ARCH_X86_64 = 0xC000003E */
+        /* On i386: AUDIT_ARCH_I386 = 0x40000003 */
+    #ifdef __aarch64__
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 1, 0),
+    #elif defined(__arm__)
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_ARM, 1, 0),
+    #elif defined(__x86_64__)
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0),
+    #elif defined(__i386__)
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_I386, 1, 0),
+    #else
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1),
+    #endif
+        /* Wrong arch → kill */
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL),
+
+        /* Reload syscall number */
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+
+        /* Trap openat — intercept file opens (most critical) */
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+
+        /* Trap readlinkat — intercept symlink reads */
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_readlinkat, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+
+        /* Trap getdents64 — intercept directory listing */
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_getdents64, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+
+        /* Trap faccessat */
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_faccessat, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+
+        /* Trap newfstatat */
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_newfstatat, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+
+    #ifdef __NR_access
+        /* Trap access (32-bit only on ARM/x86) */
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_access, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+    #endif
+    #ifdef __NR_faccessat2
+        /* Trap faccessat2 (Android 11+) */
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_faccessat2, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+    #endif
+    #ifdef __NR_stat
+        /* Trap stat (32-bit only) */
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_stat, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+    #endif
+
+        /* NOTE: read() is NOT trapped to avoid recursion in handler.
+         * Instead, we intercept openat() and return a pre-filtered memfd,
+         * so subsequent read() calls get filtered content automatically. */
+
+        /* Default: allow all other syscalls */
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+
+    struct sock_fprog prog = {
+        .len = sizeof(filter) / sizeof(filter[0]),
+        .filter = filter,
+    };
+
+    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog, 0, 0) != 0) {
+        LOGE("prctl(PR_SET_SECCOMP) failed: %d", errno);
+        return;
+    }
+
+    g_seccomp_active = true;
+    LOGI("seccomp BPF installed — trapping raw syscalls (openat, read, readlinkat, getdents64, faccessat, newfstatat)");
+}
+
 class StealthModule : public zygisk::ModuleBase {
     zygisk::Api *api = nullptr;
     JNIEnv *env = nullptr;
@@ -2530,7 +2831,15 @@ public:
         remove_from_solist();
         LOGI("solist cleanup done");
     }
-    void postAppSpecialize(const zygisk::AppSpecializeArgs *) override {}
+    void postAppSpecialize(const zygisk::AppSpecializeArgs *) override {
+        /* v5.4: Install seccomp BPF filter AFTER all hooks are in place.
+         * This traps raw syscalls (svc #0) that bypass PLT hooks.
+         * Must be in postAppSpecialize so our own setup code in
+         * preAppSpecialize isn't affected. */
+        if (g_hidden) {
+            install_seccomp_filter();
+        }
+    }
     /* Do NOT hook system_server — it breaks mount namespace for all forks
      * and causes root access issues in child processes. */
     void preServerSpecialize(zygisk::ServerSpecializeArgs *) override {}
