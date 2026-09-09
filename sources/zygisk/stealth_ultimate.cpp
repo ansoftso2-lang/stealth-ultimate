@@ -311,10 +311,9 @@ static bool is_hidden_path(const char *path) {
         "/data/local/tmp/.frida","/data/local/tmp/frida-server",
         "/system/lib/libfrida","/system/lib64/libfrida",
         "/system/lib/libgadget","/system/lib64/libgadget",
-        /* v5.8: Native Detector specific paths */
-        "/system/product/bin/magisk","/system/product/bin/magiskpolicy",
-        "IconifyComponent","/system/apex/com.android.art/bin/dex2oat",
-        "dex2oat32","dex2oat64","dex2oat",
+        /* NOTE: dex2oat, IconifyComponent, com.android.art are NOT hidden here.
+         * Hiding dex2oat in openat() breaks ART compilation → apps can't launch.
+         * These are only filtered from /proc/self/maps and mountinfo text. */
         nullptr
     };
     for (size_t i = 0; kHidden[i]; ++i) if (su_strstr(path, kHidden[i])) return true;
@@ -352,8 +351,8 @@ static bool is_hidden_name(const char *name) {
         /* v5.2: LSPosed/Xposed package names for /data/app/ scanning */
         "org.lsposed.manager","org.lsposed","de.robv.android.xposed",
         "de.robv.android.xposed.installer",
-        /* v5.8: Native Detector specific names */
-        "IconifyComponent","dex2oat","dex2oat32","dex2oat64",
+        /* NOTE: dex2oat, IconifyComponent NOT hidden here — breaks ART compilation.
+         * Only filtered from maps/mountinfo text output. */
         nullptr
     };
     for (size_t i = 0; kHN[i]; ++i) {
