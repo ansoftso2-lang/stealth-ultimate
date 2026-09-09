@@ -872,9 +872,18 @@ static void remove_from_solist(void) {
  * read() time what file the fd points to, and filter content accordingly. */
 static int check_fd_target(int fd) {
     if (fd < 0) return 0;
-    char link[64];
+    char link[32];
     char target[PATH_MAX];
-    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    /* v5.8g: Manual format instead of snprintf (async-signal-safe) */
+    const char prefix[] = "/proc/self/fd/";
+    int plen = sizeof(prefix) - 1;
+    memcpy(link, prefix, plen);
+    char numbuf[12];
+    int nlen = 0;
+    if (fd == 0) { numbuf[nlen++] = '0'; }
+    else { int tmp = fd; while (tmp > 0) { numbuf[nlen++] = '0' + (tmp % 10); tmp /= 10; } }
+    for (int i = 0; i < nlen; ++i) link[plen + i] = numbuf[nlen - 1 - i];
+    link[plen + nlen] = '\0';
     /* v5.8c: Use raw syscall with magic bypass when seccomp is active,
      * to avoid infinite recursion (real_readlinkat → svc #0 → seccomp trap). */
     ssize_t n;
@@ -1037,31 +1046,63 @@ static void patch_cmdline(char *buf, size_t len) {
 
 /* Simple fd→filter-kind cache to avoid readlink on every read() call. */
 #define SU_FD_CACHE_SIZE 64
+/* v5.8g: Thread-safe fd cache using a simple spinlock.
+ * The SIGSYS handler runs in signal context on whatever thread made
+ * the syscall. Multiple threads can be in the handler simultaneously.
+ * Without synchronization, concurrent fd_cache access corrupts the
+ * cache and crashes the process. */
 static struct { int fd; int kind; } g_fd_cache[SU_FD_CACHE_SIZE];
 static int g_fd_cache_next = 0;
+static volatile int g_fd_cache_lock = 0;
+
+static void fd_cache_lock_acquire(void) {
+    while (__sync_lock_test_and_set(&g_fd_cache_lock, 1)) {
+        /* Spin-wait. In signal handler, we can't sleep.
+         * This is safe because the critical section is very short. */
+    }
+}
+static void fd_cache_lock_release(void) {
+    __sync_lock_release(&g_fd_cache_lock);
+}
 
 static void fd_cache_set(int fd, int kind) {
+    fd_cache_lock_acquire();
     for (int i = 0; i < SU_FD_CACHE_SIZE; ++i) {
-        if (g_fd_cache[i].fd == fd) { g_fd_cache[i].kind = kind; return; }
+        if (g_fd_cache[i].fd == fd) { g_fd_cache[i].kind = kind; fd_cache_lock_release(); return; }
     }
     g_fd_cache[g_fd_cache_next].fd = fd;
     g_fd_cache[g_fd_cache_next].kind = kind;
     g_fd_cache_next = (g_fd_cache_next + 1) % SU_FD_CACHE_SIZE;
+    fd_cache_lock_release();
 }
 
 static int fd_cache_get(int fd) {
+    fd_cache_lock_acquire();
+    int result = -1;
     for (int i = 0; i < SU_FD_CACHE_SIZE; ++i) {
-        if (g_fd_cache[i].fd == fd) return g_fd_cache[i].kind;
+        if (g_fd_cache[i].fd == fd) { result = g_fd_cache[i].kind; break; }
     }
-    return -1;
+    fd_cache_lock_release();
+    return result;
 }
 
 static int fd_filter_kind(int fd) {
     int cached = fd_cache_get(fd);
     if (cached >= 0) return cached;
-    char fdpath[64];
+    char fdpath[32];
     char link[PATH_MAX];
-    snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", fd);
+    /* v5.8g: Manual format instead of snprintf — snprintf is NOT
+     * async-signal-safe. This builds "/proc/self/fd/N" manually. */
+    const char prefix[] = "/proc/self/fd/";
+    int plen = sizeof(prefix) - 1;
+    memcpy(fdpath, prefix, plen);
+    /* Convert fd to decimal */
+    char numbuf[12];
+    int nlen = 0;
+    if (fd == 0) { numbuf[nlen++] = '0'; }
+    else { int tmp = fd; while (tmp > 0) { numbuf[nlen++] = '0' + (tmp % 10); tmp /= 10; } }
+    for (int i = 0; i < nlen; ++i) fdpath[plen + i] = numbuf[nlen - 1 - i];
+    fdpath[plen + nlen] = '\0';
     /* v5.8c: Use readlinkat with magic bypass when seccomp is active.
      * __NR_readlink doesn't exist on ARM64 — only readlinkat. */
     ssize_t n;
@@ -2864,10 +2905,11 @@ static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
             SET_RET(-ENOENT);
             return;
         }
-        if (path && is_proc_filterable(path)) {
-            int memfd = create_filtered_memfd(path);
-            if (memfd >= 0) { SET_RET(memfd); return; }
-        }
+        /* v5.8g: Don't call create_filtered_memfd() here — it uses malloc()
+         * which is NOT async-signal-safe. Calling malloc from a signal
+         * handler corrupts the heap and crashes the process.
+         * Instead, just do the real openat. The read() handler will
+         * filter the data when the fd is read. */
         /* Perform real syscall with magic bypass */
         long ret = syscall(__NR_openat, dfd, path, flags, mode, su_magic);
         SET_RET(ret);
