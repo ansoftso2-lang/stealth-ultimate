@@ -798,12 +798,43 @@ static int check_fd_target(int fd) {
 /* ── TracerPid patcher ── */
 static void patch_tracerpid(char *buf, size_t len) {
     if (!buf || len == 0) return;
+    /* Patch TracerPid to 0 */
     const char needle[] = "TracerPid:";
     const size_t nlen = sizeof(needle) - 1;
     for (size_t i = 0; i + nlen <= len; ) {
         if (memcmp(buf + i, needle, nlen) == 0) {
             size_t j = i + nlen;
             while (j < len && (buf[j] == ' ' || buf[j] == '\t')) { buf[j] = '\t'; j++; }
+            size_t k = j;
+            while (k < len && buf[k] >= '0' && buf[k] <= '9') {
+                buf[k] = (k == j) ? '0' : ' ';
+                k++;
+            }
+            i = k;
+        } else { i++; }
+    }
+    /* Also patch Seccomp field to 0 (disable) — MagiskDetector checks this */
+    const char sneedle[] = "Seccomp:";
+    const size_t snlen = sizeof(sneedle) - 1;
+    for (size_t i = 0; i + snlen <= len; ) {
+        if (memcmp(buf + i, sneedle, snlen) == 0) {
+            size_t j = i + snlen;
+            while (j < len && (buf[j] == ' ' || buf[j] == '\t')) j++;
+            size_t k = j;
+            while (k < len && buf[k] >= '0' && buf[k] <= '9') {
+                buf[k] = (k == j) ? '0' : ' ';
+                k++;
+            }
+            i = k;
+        } else { i++; }
+    }
+    /* Patch NoNewPrivs to 0 */
+    const char nneedle[] = "NoNewPrivs:";
+    const size_t nnlen = sizeof(nneedle) - 1;
+    for (size_t i = 0; i + nnlen <= len; ) {
+        if (memcmp(buf + i, nneedle, nnlen) == 0) {
+            size_t j = i + nnlen;
+            while (j < len && (buf[j] == ' ' || buf[j] == '\t')) j++;
             size_t k = j;
             while (k < len && buf[k] >= '0' && buf[k] <= '9') {
                 buf[k] = (k == j) ? '0' : ' ';
@@ -1113,11 +1144,8 @@ static int create_filtered_memfd(const char *path) {
     if (!is_maps && !is_mountinfo && !is_environ && !is_status && !is_cmdline &&
         !is_stat && !is_attr && !is_cgroup && !is_wchan && !is_filesystems && !is_net && !is_misc_proc) return -1;
 
-    /* Read the real file content.
-     * Use raw syscall with SU_SECCOMP_MAGIC to bypass our own seccomp filter.
-     * (real_openat calls libc openat which does svc #0, which seccomp traps) */
-    int real_fd = (int)syscall(__NR_openat, AT_FDCWD, path, O_RDONLY, 0,
-                               (long)SU_SECCOMP_MAGIC);
+    /* Read the real file content */
+    int real_fd = real_openat ? real_openat(AT_FDCWD, path, O_RDONLY, 0) : -1;
     if (real_fd < 0) return -1;
 
     /* Read entire content into a buffer */
@@ -2001,7 +2029,8 @@ static ssize_t my_sendfile(int out_fd, int in_fd, off_t *offset, size_t count) {
     return real_sendfile ? real_sendfile(out_fd, in_fd, offset, count) : -1;
 }
 
-/* prctl: PR_GET_NAME can reveal thread names like "magiskd" */
+/* prctl: PR_GET_NAME can reveal thread names like "magiskd".
+ * Also intercept PR_GET_SECCOMP to hide seccomp status. */
 static int my_prctl(int option, ...) {
     va_list ap; va_start(ap, option);
     unsigned long arg2 = va_arg(ap, unsigned long);
@@ -2009,6 +2038,12 @@ static int my_prctl(int option, ...) {
     unsigned long arg4 = va_arg(ap, unsigned long);
     unsigned long arg5 = va_arg(ap, unsigned long);
     va_end(ap);
+
+    /* Hide seccomp status — MagiskDetector checks this */
+    if (g_hidden && option == PR_GET_SECCOMP) {
+        return 0;  /* SECCOMP_MODE_DISABLED — no seccomp active */
+    }
+
     int r = real_prctl ? real_prctl(option, arg2, arg3, arg4, arg5) : -1;
     if (g_hidden && r == 0 && option == PR_GET_NAME) {
         char *name = (char*)arg2;
@@ -2877,13 +2912,21 @@ public:
         LOGI("solist cleanup done");
     }
     void postAppSpecialize(const zygisk::AppSpecializeArgs *) override {
-        /* v5.4: Install seccomp BPF filter AFTER all hooks are in place.
-         * This traps raw syscalls (svc #0) that bypass PLT hooks.
-         * Must be in postAppSpecialize so our own setup code in
-         * preAppSpecialize isn't affected. */
-        if (g_hidden) {
-            install_seccomp_filter();
-        }
+        /* v5.4b: seccomp BPF removed — it is COUNTERPRODUCTIVE.
+         *
+         * Reasons:
+         * 1. MagiskDetector checks prctl(PR_GET_SECCOMP) and /proc/self/status
+         *    Seccomp field → installing a filter ADDS a detection vector.
+         * 2. seccomp traps ALL openat/getdents64/etc in the entire process,
+         *    including ART, binder, Android runtime → crash risk + perf hit.
+         * 3. seccomp filters cannot be removed once installed → permanent.
+         *
+         * Instead, we rely on:
+         * - PLT hooks for all libc-based syscalls (covers NativeDetector)
+         * - FORCE_DENYLIST_UNMOUNT to clean kernel view (covers raw syscalls)
+         *   When Magisk unmounts its traces, even raw svc #0 sees clean state.
+         * - /proc/self/status filtering to hide Seccomp/TracerPid fields
+         */
     }
     /* Do NOT hook system_server — it breaks mount namespace for all forks
      * and causes root access issues in child processes. */
