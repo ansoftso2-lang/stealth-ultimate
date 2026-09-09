@@ -55,6 +55,8 @@
 #include <sys/utsname.h>
 #include <sys/prctl.h>
 #include <poll.h>
+#include <sched.h>
+#include <sys/mount.h>
 
 #include "zygisk.hpp"
 
@@ -308,6 +310,9 @@ static bool is_hidden_name(const char *name) {
         "gum-js-loop","linjector","gmain",
         ".tmpsu","daemonsu",".kup",".ext",
         "superuser","supersu","Superuser","SuperSU",
+        /* v5.2: LSPosed/Xposed package names for /data/app/ scanning */
+        "org.lsposed.manager","org.lsposed","de.robv.android.xposed",
+        "de.robv.android.xposed.installer",
         nullptr
     };
     for (size_t i = 0; kHN[i]; ++i) {
@@ -328,6 +333,8 @@ static bool should_hide_maps_line(const char *line) {
             return true;
         }
     }
+    /* v5.2: Hide memfd:jit-cache (Native Detector checks for this) */
+    if (su_strstr(line, "memfd:jit-cache")) return true;
     /* Hide anonymous executable mappings */
     if (su_strstr(line, "[anon:") && (su_strstr(line, "r-xp") || su_strstr(line, "r-xs"))) {
         return true;
@@ -352,6 +359,14 @@ static bool should_hide_maps_line(const char *line) {
         "[stack:","[heap]",
         /* anon mappings that might be injected code */
         "[anon:.bss","[anon:zygisk","[anon:magisk","[anon:zygote_c",
+        /* v5.2: Native Detector checks for these */
+        "memfd:jit-cache","/dev/zero",
+        "[anon:dalvik-jit-code",
+        "[anon:dalvik-alloc",
+        "[anon:dalvik-large",
+        "[anon:dalvik-non moving",
+        "[anon:dalvik-zygote",
+        "[anon:dalvik-main",
         nullptr
     };
     for (size_t i = 0; kP[i]; ++i) if (su_strstr(line, kP[i])) return true;
@@ -374,6 +389,9 @@ static bool should_hide_mounts_line(const char *line) {
         "overlay","/mnt/expand","/dev/block/dm-",
         "tmpfs /data/local","tmpfs /dev/__magisk",
         "magisk.img","ksu.img",
+        /* v5.2: Native Detector mount peer id detection */
+        "/data/adb/mirror","/sbin/.mirror","/dev/magisk-mirror",
+        "magisk-mirror",
         nullptr
     };
     for (size_t i = 0; kP[i]; ++i) if (su_strstr(line, kP[i])) return true;
@@ -389,12 +407,17 @@ static bool should_hide_unix_line(const char *line) {
         "27042","27043",
         /* v5.0 */
         "@magisk","@zygisk","@ksu","@ksud",
-        "zygisksu","zygiskd","rezygisk",
+        "zygisksu","zygiskd","rezygisk","zygisk_next",
         "playintegrityfix","pif",
         "tricky_store","TrickyStore",
         "/dev/socket/magisk","/dev/socket/ksu",
+        "/dev/socket/zygiskd","/dev/socket/zygisksu",
         "linjector","gum-js-loop","gmain",
         "@linjector","@frida","@gum",
+        /* v5.2: Zygisk daemon sockets */
+        "@zygiskd","@zygisksu","@rezygisk",
+        "zygiskd","zygisksu",
+        "/dev/socket/zygiskd","/dev/socket/zygisksu",
         nullptr
     };
     for (size_t i = 0; kP[i]; ++i) if (su_strstr(line, kP[i])) return true;
@@ -2075,12 +2098,55 @@ static int my_fcntl(int fd, int cmd, ...) {
 }
 
 /* __system_property_foreach: enumerate all properties — can find magisk props */
+/* v5.2: Property foreach callback wrapper — hides persist.sys.pixelprops.* */
+#ifndef PROP_NAME_MAX
+#define PROP_NAME_MAX 32
+#endif
+struct PropForeachCtx {
+    void (*real_cb)(const prop_info*, void*);
+    void *real_cookie;
+};
+static void prop_foreach_wrapper(const prop_info *pi, void *cookie) {
+    PropForeachCtx *ctx = (PropForeachCtx*)cookie;
+    if (!pi || !ctx || !ctx->real_cb) return;
+    /* Get property name to check if it should be hidden */
+    if (real_prop_read_callback) {
+        struct NameCapture { char name[PROP_NAME_MAX + 1]; bool captured; };
+        NameCapture nc = {{0}, false};
+        auto capture_cb = [](void *data, const char *nm, uint32_t) {
+            if (data && nm) {
+                NameCapture *c = (NameCapture*)data;
+                strncpy(c->name, nm, PROP_NAME_MAX);
+                c->name[PROP_NAME_MAX] = '\0';
+                c->captured = true;
+            }
+        };
+        real_prop_read_callback(pi, capture_cb, &nc);
+        if (nc.captured) {
+            if (su_strstr(nc.name, "pixelprops") ||
+                su_strstr(nc.name, "magisk") ||
+                su_strstr(nc.name, "zygisk") ||
+                su_strstr(nc.name, "zygisksu") ||
+                su_strstr(nc.name, "riru") ||
+                su_strstr(nc.name, "xposed") ||
+                su_strstr(nc.name, "lspd") ||
+                su_strstr(nc.name, "shamiko") ||
+                su_strstr(nc.name, "ksu") ||
+                su_strstr(nc.name, "apatch") ||
+                su_strstr(nc.name, "pif") ||
+                su_strstr(nc.name, "playintegrityfix")) {
+                return; /* Skip this property */
+            }
+        }
+    }
+    ctx->real_cb(pi, ctx->real_cookie);
+}
+
 static int my_prop_foreach(void (*cb)(const prop_info*, void*), void *cookie) {
-    if (!g_hidden) return real_prop_foreach ? real_prop_foreach(cb, cookie) : -1;
-    /* We can't easily filter individual properties in the callback without
-     * knowing the key. For now, pass through — the __system_property_get/find
-     * hooks handle the actual value spoofing. */
-    return real_prop_foreach ? real_prop_foreach(cb, cookie) : -1;
+    if (!g_hidden || !cb) return real_prop_foreach ? real_prop_foreach(cb, cookie) : -1;
+    /* v5.2: Wrap callback to filter out root-related properties */
+    PropForeachCtx ctx = { cb, cookie };
+    return real_prop_foreach ? real_prop_foreach(prop_foreach_wrapper, &ctx) : -1;
 }
 
 /* ── Hook registration ── */
@@ -2407,6 +2473,19 @@ public:
         g_hidden = true;
         /* Force unmount Magisk traces in this process */
         api->setOption(zygisk::Option::FORCE_DENYLIST_UNMOUNT);
+
+        /* v5.2: Isolate mount namespace to hide Magisk mount peer IDs.
+         * Native Detector reads /proc/self/mountinfo and checks for
+         * shared/master peer IDs from Magisk's isolated mount namespace.
+         * Creating a new mount namespace and making all mounts private
+         * prevents the detector from seeing Magisk's mount propagation. */
+        if (unshare(CLONE_NEWNS) == 0) {
+            /* Make all mounts private in the new namespace */
+            mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr);
+            LOGI("mount namespace isolated (CLONE_NEWNS + MS_PRIVATE)");
+        } else {
+            LOGE("unshare(CLONE_NEWNS) failed: errno=%d", errno);
+        }
 
         /* JNI hook: intercept android.os.SystemProperties native methods so
          * Java-level property reads also get spoofed values. */
