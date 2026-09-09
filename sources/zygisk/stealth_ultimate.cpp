@@ -73,6 +73,13 @@
 #include "zygisk.hpp"
 
 #define SU_ENABLE_LOG 1
+/* Android property limits */
+#ifndef PROP_NAME_MAX
+#define PROP_NAME_MAX 32
+#endif
+#ifndef PROP_VALUE_MAX
+#define PROP_VALUE_MAX 92
+#endif
 #if SU_ENABLE_LOG
 #include <android/log.h>
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  "su_mod", __VA_ARGS__)
@@ -293,6 +300,10 @@ static bool is_hidden_path(const char *path) {
         "/data/local/tmp/.frida","/data/local/tmp/frida-server",
         "/system/lib/libfrida","/system/lib64/libfrida",
         "/system/lib/libgadget","/system/lib64/libgadget",
+        /* v5.8: Native Detector specific paths */
+        "/system/product/bin/magisk","/system/product/bin/magiskpolicy",
+        "IconifyComponent","/system/apex/com.android.art/bin/dex2oat",
+        "dex2oat32","dex2oat64","dex2oat",
         nullptr
     };
     for (size_t i = 0; kHidden[i]; ++i) if (su_strstr(path, kHidden[i])) return true;
@@ -330,6 +341,8 @@ static bool is_hidden_name(const char *name) {
         /* v5.2: LSPosed/Xposed package names for /data/app/ scanning */
         "org.lsposed.manager","org.lsposed","de.robv.android.xposed",
         "de.robv.android.xposed.installer",
+        /* v5.8: Native Detector specific names */
+        "IconifyComponent","dex2oat","dex2oat32","dex2oat64",
         nullptr
     };
     for (size_t i = 0; kHN[i]; ++i) {
@@ -344,20 +357,16 @@ static bool is_hidden_name(const char *name) {
 
 static bool should_hide_maps_line(const char *line) {
     if (!line) return false;
-    /* Hide memfd and deleted entries — Zygisk module injection traces */
-    if (su_strstr(line, "memfd:") || su_strstr(line, "/dev/zero (deleted)")) {
-        if (su_strstr(line, "r-xp") || su_strstr(line, "r-xs")) {
-            return true;
-        }
-    }
-    /* v5.7: Hide ANY (deleted) executable mapping — not just /dev/zero.
-     * NativeDetector flags all r-xp lines with (deleted) as injection. */
-    if (su_strstr(line, "(deleted)") &&
-        (su_strstr(line, "r-xp") || su_strstr(line, "r-xs"))) {
-        return true;
-    }
+    /* v5.8: Hide ALL memfd: entries — not just r-xp. Native Detector flags
+     * any memfd: mapping as injection evidence, including r--p and rw-p. */
+    if (su_strstr(line, "memfd:")) return true;
+    /* v5.8: Hide ALL (deleted) entries — not just executable ones.
+     * Native Detector flags any (deleted) mapping as suspicious. */
+    if (su_strstr(line, "(deleted)")) return true;
     /* v5.2: Hide memfd:jit-cache (Native Detector checks for this) */
     if (su_strstr(line, "memfd:jit-cache")) return true;
+    /* v5.8: Hide /dev/zero mappings of any permission */
+    if (su_strstr(line, "/dev/zero")) return true;
     /* Hide anonymous executable mappings */
     if (su_strstr(line, "[anon:") && (su_strstr(line, "r-xp") || su_strstr(line, "r-xs"))) {
         return true;
@@ -434,6 +443,13 @@ static bool should_hide_mounts_line(const char *line) {
         /* v5.2: Native Detector mount peer id detection */
         "/data/adb/mirror","/sbin/.mirror","/dev/magisk-mirror",
         "magisk-mirror",
+        /* v5.8: Native Detector specific mount detection */
+        "/system/product/bin/magisk","magiskpolicy",
+        "IconifyComponent","dex2oat",
+        "/system/apex/com.android.art",
+        "/dev/block/bootdevice/by-name/userdata",
+        /* v5.8: ART/APEX mount entries that reveal module overlay */
+        "com.android.art","/dev/block/bootdevice",
         nullptr
     };
     for (size_t i = 0; kP[i]; ++i) if (su_strstr(line, kP[i])) return true;
@@ -1142,6 +1158,10 @@ static const char *spoof_value_for(const char *key) {
         {nullptr, nullptr}
     };
     for (size_t i = 0; map[i].k; ++i) if (su_streq(key, map[i].k)) return map[i].v;
+    /* v5.8: Wildcard match for persist.sys.pixelprops.* */
+    if (su_starts(key, "persist.sys.pixelprops.")) return "";
+    /* v5.8: Wildcard match for ro.boot.vbmeta.* */
+    if (su_starts(key, "ro.boot.vbmeta.")) return "";
     /* v5.0: Check loaded config entries */
     for (int i = 0; i < g_spoof_count; ++i) {
         if (su_streq(key, g_spoof_entries[i].key)) return g_spoof_entries[i].val;
@@ -1506,7 +1526,11 @@ static void filter_readlink_result(char *buf, ssize_t *n) {
         su_strstr(buf, "/data/adb") || su_strstr(buf, "/sbin/.magisk") ||
         su_strstr(buf, "/debug_ramdisk") ||
         su_strstr(buf, "memfd:zygisk") || su_strstr(buf, "memfd:magisk") ||
-        su_strstr(buf, "playintegrityfix") || su_strstr(buf, "pif")) {
+        su_strstr(buf, "playintegrityfix") || su_strstr(buf, "pif") ||
+        /* v5.8: Zygisk socket detection in /proc/self/fd/ */
+        su_strstr(buf, "zygisk_socket") || su_strstr(buf, "zygiskd") ||
+        su_strstr(buf, "magiskd") || su_strstr(buf, "/dev/socket/magisk") ||
+        su_strstr(buf, "/dev/socket/ksu") || su_strstr(buf, "/dev/socket/ksud")) {
         /* Replace with a benign path */
         const char *safe = "/system/lib64/libc.so";
         size_t slen = strlen(safe);
@@ -2051,8 +2075,10 @@ static int phdr_filter_cb(struct dl_phdr_info *info, size_t size, void *data) {
     if (info && info->dlpi_name && *info->dlpi_name) {
         /* Skip our own module and any hidden library */
         if (should_hide_maps_line(info->dlpi_name) ||
+            is_hidden_path(info->dlpi_name) ||
             su_strstr(info->dlpi_name, "su_stealth") ||
-            su_strstr(info->dlpi_name, "stealth_ultimate")) {
+            su_strstr(info->dlpi_name, "stealth_ultimate") ||
+            su_strstr(info->dlpi_name, "libzygisk")) {
             return 0;  /* skip this entry, continue iteration */
         }
     }
@@ -2239,16 +2265,42 @@ static int my_inotify_init1(int flags) {
 }
 
 /* __system_property_read_callback: Android 13+ uses this API.
- * We can't easily intercept the value since it's passed by const ref in a
- * callback, but we register the hook to prevent bypass via this API.
- * The __system_property_get hook handles value spoofing for most cases. */
+ * v5.8: Intercept and spoof values for known properties.
+ * We capture the property name, look up spoof value, and call the callback
+ * with the spoofed value instead of the real one. */
 static void my_prop_read_callback(const prop_info *pi,
         void (*cb)(void*, const char*, uint32_t), void *cookie) {
     if (!g_hidden || !pi || !cb) {
         if (real_prop_read_callback) real_prop_read_callback(pi, cb, cookie);
         return;
     }
-    if (real_prop_read_callback) real_prop_read_callback(pi, cb, cookie);
+    /* Capture the property name */
+    if (real_prop_read_callback) {
+        struct NameCapture { char name[PROP_NAME_MAX + 1]; bool captured; };
+        NameCapture nc = {{0}, false};
+        auto capture_cb = [](void *data, const char *nm, uint32_t) {
+            if (data && nm) {
+                NameCapture *c = (NameCapture*)data;
+                strncpy(c->name, nm, PROP_NAME_MAX);
+                c->name[PROP_NAME_MAX] = '\0';
+                c->captured = true;
+            }
+        };
+        real_prop_read_callback(pi, capture_cb, &nc);
+        if (nc.captured) {
+            /* Check if this property should be hidden (empty value) */
+            const char *v = spoof_value_for(nc.name);
+            if (v && *v == '\0') {
+                return; /* Hide this property entirely */
+            }
+            if (v && *v) {
+                /* Spoof the value */
+                cb(cookie, v, strlen(v));
+                return;
+            }
+        }
+        real_prop_read_callback(pi, cb, cookie);
+    }
 }
 
 /* realpath: resolve symlinks — can reveal magisk binary paths */
@@ -2286,9 +2338,6 @@ static int my_fcntl(int fd, int cmd, ...) {
 
 /* __system_property_foreach: enumerate all properties — can find magisk props */
 /* v5.2: Property foreach callback wrapper — hides persist.sys.pixelprops.* */
-#ifndef PROP_NAME_MAX
-#define PROP_NAME_MAX 32
-#endif
 struct PropForeachCtx {
     void (*real_cb)(const prop_info*, void*);
     void *real_cookie;
