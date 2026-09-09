@@ -2527,9 +2527,9 @@ static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
     if (info->si_code != SYS_SECCOMP) return;
 
     /* Handle each trapped syscall.
-     * All real syscall() calls pass SU_SECCOMP_MAGIC as arg4 (unused by
+     * All real syscall() calls pass magic value as arg4 (unused by
      * these syscalls) so the BPF filter allows them through. */
-    #define SU_MAGIC_ (long)SU_SECCOMP_MAGIC
+    long su_magic = (long)SU_SECCOMP_MAGIC;
     switch (syscall_nr) {
     case __NR_openat: {
         int dfd = (int)arg0;
@@ -2546,7 +2546,7 @@ static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
             if (memfd >= 0) { SET_RET(memfd); return; }
         }
         /* Perform real syscall with magic bypass */
-        long ret = syscall(__NR_openat, dfd, path, flags, mode, SU_MAGIC_);
+        long ret = syscall(__NR_openat, dfd, path, flags, mode, su_magic);
         SET_RET(ret);
         return;
     }
@@ -2556,7 +2556,7 @@ static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
         char *buf = (char*)arg2;
         size_t bufsiz = (size_t)arg3;
         if (path && is_hidden_path(path)) { SET_RET(-ENOENT); return; }
-        long n = syscall(__NR_readlinkat, dirfd, path, buf, bufsiz, SU_MAGIC_);
+        long n = syscall(__NR_readlinkat, dirfd, path, buf, bufsiz, su_magic);
         if (n > 0) { ssize_t sn = n; filter_readlink_result(buf, &sn); n = sn; }
         SET_RET(n);
         return;
@@ -2565,7 +2565,7 @@ static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
         int fd = (int)arg0;
         struct dirent *dirp = (struct dirent*)arg1;
         unsigned int count = (unsigned int)arg2;
-        long n = syscall(__NR_getdents64, fd, dirp, count, SU_MAGIC_);
+        long n = syscall(__NR_getdents64, fd, dirp, count, su_magic);
         if (n > 0) {
             long w = 0, i = 0;
             while (i < n) {
@@ -2586,7 +2586,7 @@ static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
         const char *path = (const char*)arg0;
         int mode = (int)arg1;
         if (path && is_hidden_path(path)) { SET_RET(-ENOENT); return; }
-        SET_RET(syscall(__NR_access, path, mode, 0, SU_MAGIC_);
+        SET_RET(syscall(__NR_access, path, mode, 0, su_magic);
         return;
     }
     #endif
@@ -2595,7 +2595,7 @@ static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
         const char *path = (const char*)arg1;
         int mode = (int)arg2;
         if (path && is_hidden_path(path)) { SET_RET(-ENOENT); return; }
-        SET_RET(syscall(__NR_faccessat, dirfd, path, mode, 0, SU_MAGIC_);
+        SET_RET(syscall(__NR_faccessat, dirfd, path, mode, 0, su_magic);
         return;
     }
     #ifdef __NR_faccessat2
@@ -2605,7 +2605,7 @@ static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
         int mode = (int)arg2;
         int flags = (int)arg3;
         if (path && is_hidden_path(path)) { SET_RET(-ENOENT); return; }
-        SET_RET(syscall(__NR_faccessat2, dirfd, path, mode, flags, SU_MAGIC_);
+        SET_RET(syscall(__NR_faccessat2, dirfd, path, mode, flags, su_magic);
         return;
     }
     #endif
@@ -2614,7 +2614,7 @@ static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
         const char *path = (const char*)arg0;
         struct stat *buf = (struct stat*)arg1;
         if (path && is_hidden_path(path)) { if (buf) memset(buf, 0, sizeof(*buf)); SET_RET(-ENOENT); return; }
-        SET_RET(syscall(__NR_stat, path, buf, 0, SU_MAGIC_);
+        SET_RET(syscall(__NR_stat, path, buf, 0, su_magic);
         return;
     }
     #endif
@@ -2625,7 +2625,7 @@ static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
         struct stat *buf = (struct stat*)arg2;
         int flags = (int)arg3;
         if (path && is_hidden_path(path)) { if (buf) memset(buf, 0, sizeof(*buf)); SET_RET(-ENOENT); return; }
-        SET_RET(syscall(__NR_newfstatat, dirfd, path, buf, flags, SU_MAGIC_);
+        SET_RET(syscall(__NR_newfstatat, dirfd, path, buf, flags, su_magic);
         return;
     }
     #elif defined(__NR_fstatat)
@@ -2635,7 +2635,7 @@ static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
         struct stat *buf = (struct stat*)arg2;
         int flags = (int)arg3;
         if (path && is_hidden_path(path)) { if (buf) memset(buf, 0, sizeof(*buf)); SET_RET(-ENOENT); return; }
-        SET_RET(syscall(__NR_fstatat, dirfd, path, buf, flags, SU_MAGIC_);
+        SET_RET(syscall(__NR_fstatat, dirfd, path, buf, flags, su_magic);
         return;
     }
     #endif
