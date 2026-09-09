@@ -365,23 +365,19 @@ static bool should_hide_maps_line(const char *line) {
     /* v5.7: Hide purely anonymous r-xp mappings (no pathname).
      * Format: "addr-addr r-xp offset dev inode" with NO trailing path.
      * These are injected code pages — legitimate ART JIT has [anon:dalvik-*]. */
-    {
-        const char *perms = su_strstr(line, " r-xp");
-        if (!perms) perms = su_strstr(line, " r-xs");
-        if (perms) {
-            /* Check if there's a pathname after the inode field.
-             * If the line has no '[', no '/', no '(' after the last space,
-             * it's a purely anonymous executable mapping. */
-            const char *last_space = nullptr;
-            for (const char *p = line; *p; p++) {
-                if (*p == ' ') last_space = p;
-            }
-            if (last_space) {
-                const char *path = last_space + 1;
-                /* Empty path or just "0" means no pathname */
-                if (*path == '\0' || (path[0] == '0' && path[1] == '\0')) {
-                    return true;
-                }
+    if (su_strstr(line, " r-xp") || su_strstr(line, " r-xs")) {
+        /* Check if there's a pathname after the inode field.
+         * If the line has no path after the last space,
+         * it's a purely anonymous executable mapping. */
+        const char *last_space = nullptr;
+        for (const char *p = line; *p; p++) {
+            if (*p == ' ') last_space = p;
+        }
+        if (last_space) {
+            const char *path = last_space + 1;
+            /* Empty path or just "0" means no pathname */
+            if (*path == '\0' || (path[0] == '0' && path[1] == '\0')) {
+                return true;
             }
         }
     }
