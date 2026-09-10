@@ -471,21 +471,30 @@ static bool should_hide_mounts_line(const char *line) {
  * "com.android.art") — using it for umount would detach system partitions
  * and crash the launcher / network / ART. This function only matches
  * Magisk/Zygisk/module-specific mount points that are safe to detach. */
-static bool should_unmount_line(const char *line) {
-    if (!line) return false;
-    /* Only match mounts that are clearly root/Zygisk/module related */
-    static const char *const kU[] = {
-        "/data/adb","/sbin/.magisk","/debug_ramdisk",
-        "magisk","/data/adb/mirror","/sbin/.mirror",
-        "magisk-mirror","libzygisk.so",
-        "zygisksu","zygiskd","rezygisk","zygisk_next",
-        "tmpfs /data/adb","tmpfs /debug_ramdisk",
-        "tmpfs /dev/__magisk","tmpfs /sbin",
-        "magisk.img","ksu.img",
-        "/data/adb/modules",
+static bool should_unmount_mountpoint(const char *mp) {
+    if (!mp || !*mp) return false;
+    /* v5.8h: Only unmount mount POINTS that are clearly root/module related.
+     * MUST NOT match /system, /vendor, /product — those are Magisk bind mounts
+     * from /dev/.magisk/mirror/ that contain "magisk" in the root field.
+     * Previous should_unmount_line() checked the ENTIRE mountinfo line,
+     * matching "magisk" in the root field → unmounting /system → all apps crash. */
+    static const char *const kExact[] = {
+        "/sbin","/debug_ramdisk",
+        "/dev/.magisk","/dev/__magisk","/dev/ksu","/dev/.ksu",
         nullptr
     };
-    for (size_t i = 0; kU[i]; ++i) if (su_strstr(line, kU[i])) return true;
+    /* Exact match or prefix for specific mount points */
+    for (size_t i = 0; kExact[i]; ++i) {
+        if (strcmp(mp, kExact[i]) == 0) return true;
+        size_t len = strlen(kExact[i]);
+        if (strncmp(mp, kExact[i], len) == 0 && mp[len] == '/') return true;
+    }
+    /* /data/adb paths — module directories */
+    if (strncmp(mp, "/data/adb", 9) == 0) return true;
+    /* /data/adb/modules/* specifically */
+    if (strncmp(mp, "/data/adb/modules", 17) == 0) return true;
+    /* Magisk/KSU image mounts */
+    if (su_strstr(mp, "magisk.img") || su_strstr(mp, "ksu.img")) return true;
     return false;
 }
 
@@ -3285,7 +3294,7 @@ static void do_manual_unmount(void) {
                 if (mp_end) *mp_end = '\0';
             }
 
-            if (mount_point && should_unmount_line(line)) {
+            if (mount_point && should_unmount_mountpoint(mount_point)) {
                 /* Unmount this mount point */
                 if (umount2(mount_point, MNT_DETACH) == 0) {
                     unmounted++;
