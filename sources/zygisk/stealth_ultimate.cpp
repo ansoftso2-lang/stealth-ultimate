@@ -694,16 +694,18 @@ static void fix_maps_device(char *line, size_t len) {
                 /* Find the end of the device field */
                 char *end = p;
                 while (*end && *end != ' ') end++;
-                /* Replace with "0:0" to obscure the real device */
+                /* Replace with "0:0" to obscure the real device.
+                 * v5.8h: Always preserve the same field length by padding
+                 * with spaces. Previous code used memmove to shrink the
+                 * field, which corrupted adjacent data when called from
+                 * line-by-line processing. */
                 char replacement[] = "0:0";
                 size_t rlen = sizeof(replacement) - 1;
                 size_t old_len = end - p;
                 if (rlen <= old_len) {
                     memcpy(p, replacement, rlen);
-                    /* Shift remaining content */
-                    if (rlen < old_len) {
-                        memmove(p + rlen, end, strlen(end) + 1);
-                    }
+                    /* Pad remaining with spaces to preserve length */
+                    for (size_t i = rlen; i < old_len; i++) p[i] = ' ';
                 }
             }
         }
@@ -725,21 +727,33 @@ static void *su_find_linker_base(void) {
     if (!fp) return nullptr;
     char line[512];
     void *base = nullptr;
+    void *first_linker = nullptr;
+    /* v5.8h: The ELF header (and program headers) are in the first segment
+     * (usually r--p). The r-xp segment is text, where e_phoff is relative
+     * to a different base. We must find the LOWEST address mapping of the
+     * linker to get the correct ELF header base. */
     while (fgets(line, sizeof(line), fp)) {
-        if ((strstr(line, "r-xp") || strstr(line, "r--p")) &&
-            (strstr(line, "/linker") || strstr(line, "/linker64"))) {
+        if ((strstr(line, "/linker") || strstr(line, "/linker64"))) {
             unsigned long addr = strtoul(line, nullptr, 16);
-            base = (void*)addr;
-            break;
+            if (first_linker == nullptr) first_linker = (void*)addr;
+            /* Prefer r--p (first segment, contains ELF header) */
+            if (strstr(line, "r--p")) {
+                base = (void*)addr;
+                break;
+            }
+            if (base == nullptr) base = (void*)addr;
         }
     }
     fclose(fp);
-    return base;
+    /* If we didn't find r--p, use the lowest mapping */
+    return base ? base : first_linker;
 }
 
 static void *su_elf_lookup_symbol(void *base, const char *symname) {
     if (!base || !symname) return nullptr;
     ElfW(Ehdr) *eh = (ElfW(Ehdr)*)base;
+    /* v5.8h: Validate ELF magic before dereferencing */
+    if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0) return nullptr;
     ElfW(Phdr) *ph = (ElfW(Phdr)*)((char*)base + eh->e_phoff);
     ElfW(Dyn) *dyn = nullptr;
     for (int i = 0; i < eh->e_phnum; ++i) {
@@ -968,6 +982,8 @@ static void filter_text_lines(char *buf, size_t len) {
         char *nl = (char*)memchr(buf + i, '\n', len - i);
         size_t line_len = nl ? (size_t)(nl - (buf + i) + 1) : (len - i);
         if (line_len) {
+            /* v5.8h: Truncate to buffer size — previous code could
+             * copy sizeof(tmp) bytes even if line_len > sizeof(tmp) */
             char tmp[512];
             size_t copy = line_len < sizeof(tmp) ? line_len : sizeof(tmp) - 1;
             memcpy(tmp, buf + i, copy);
@@ -1662,7 +1678,8 @@ static ssize_t my_readlinkat(int dirfd, const char *path, char *buf, size_t size
 
 /* v5.0: getcwd hook — if CWD is a root directory, spoof it */
 static char *my_getcwd(char *buf, size_t size) {
-    char *r = getcwd(buf, size);
+    /* v5.8h: Call real_getcwd, not getcwd (which would recurse back into this hook) */
+    char *r = real_getcwd ? real_getcwd(buf, size) : nullptr;
     if (r && g_hidden) {
         if (su_strstr(r, "/data/adb") || su_strstr(r, "/sbin/.magisk") ||
             su_strstr(r, "/debug_ramdisk") || su_strstr(r, "su_stealth") ||
@@ -1738,27 +1755,23 @@ static ssize_t my_read(int fd, void *buf, size_t count) {
             filter_text_lines((char*)buf, (size_t)n);
             /* v5.7: Strip mount propagation peer ids from mountinfo */
             strip_mount_peerids((char*)buf, (size_t)n);
-            /* v5.1: Also fix device numbers for magic mount detection */
-            /* Apply fix_maps_device to each line */
+            /* v5.1: Fix device numbers for magic mount detection.
+             * v5.8h: Apply fix_maps_device per-line using NUL-terminated copies.
+             * Previous code used strcmp on a non-NUL-terminated buffer (heap
+             * over-read) and memmove with wrong size (buffer corruption). */
             char *p = (char*)buf;
-            while (p && *p && (size_t)(p - (char*)buf) < (size_t)n) {
-                char *nl = (char*)memchr(p, '\n', (size_t)((char*)buf + n - p));
-                size_t line_len = nl ? (size_t)(nl - p + 1) : (size_t)((char*)buf + n - p);
-                char tmp[1024];
-                size_t copy = line_len < sizeof(tmp) - 1 ? line_len : sizeof(tmp) - 1;
-                memcpy(tmp, p, copy);
-                tmp[copy] = '\0';
-                fix_maps_device(tmp, copy);
-                /* Write back if modified */
-                if (strcmp(tmp, p) != 0) {
-                    /* Only copy the modified part */
-                    size_t mod_len = strlen(tmp);
-                    if (mod_len < line_len) {
-                        memmove(p + mod_len + 1, p + line_len, (size_t)((char*)buf + n - p - line_len));
-                        n -= (line_len - mod_len - 1);
-                    }
-                    memcpy(p, tmp, mod_len);
-                    p[mod_len] = '\n';
+            char *buf_end = (char*)buf + n;
+            while (p < buf_end) {
+                char *nl = (char*)memchr(p, '\n', buf_end - p);
+                size_t line_len = nl ? (size_t)(nl - p) : (size_t)(buf_end - p);
+                if (line_len > 0 && line_len < 1024) {
+                    char tmp[1024];
+                    memcpy(tmp, p, line_len);
+                    tmp[line_len] = '\0';
+                    fix_maps_device(tmp, line_len);
+                    /* Write back the modified line (same length — fix_maps_device
+                     * only replaces in-place, never changes length) */
+                    memcpy(p, tmp, line_len);
                 }
                 if (nl) p = nl + 1; else break;
             }
@@ -1790,6 +1803,9 @@ static ssize_t my_read(int fd, void *buf, size_t count) {
 static int my_uname(struct utsname *buf) {
     if (!buf) return -1;
     int r = real_uname ? real_uname(buf) : -1;
+    /* v5.8h: Only spoof uname for hidden processes. Previously this
+     * overwrote uname for ALL processes including system_server. */
+    if (!g_hidden) return r;
     snprintf(buf->sysname, sizeof(buf->sysname), "Linux");
     snprintf(buf->nodename, sizeof(buf->nodename), "localhost");
     snprintf(buf->release, sizeof(buf->release), "5.10.149-android14-13-00001-g1234567890ab");
@@ -1805,6 +1821,7 @@ static int my_ptrace(int request, ...) {
     void *addr = va_arg(ap, void *);
     void *data = va_arg(ap, void *);
     va_end(ap);
+    /* v5.8h: Only intercept PTRACE_TRACEME when hidden */
     if (g_hidden && request == PTRACE_TRACEME) return 0;
     return real_ptrace ? real_ptrace(request, pid, addr, data) : -1;
 }
@@ -1951,6 +1968,8 @@ static long my_syscall(long nr, ...) {
                 int w = 0, i = 0;
                 while (i < n) {
                     struct dirent *de = (struct dirent*)((char*)dirp + i);
+                    /* v5.8h: Guard against d_reclen==0 (corrupt entry → infinite loop) */
+                    if (de->d_reclen == 0) break;
                     if (!is_hidden_name(de->d_name)) {
                         if (w != i) memmove((char*)dirp + w, (char*)dirp + i, de->d_reclen);
                         w += de->d_reclen;
@@ -1973,6 +1992,7 @@ static long my_syscall(long nr, ...) {
                 int w = 0, i = 0;
                 while (i < n) {
                     struct dirent *de = (struct dirent*)((char*)dirp + i);
+                    if (de->d_reclen == 0) break;
                     if (!is_hidden_name(de->d_name)) {
                         if (w != i) memmove((char*)dirp + w, (char*)dirp + i, de->d_reclen);
                         w += de->d_reclen;
@@ -2046,9 +2066,18 @@ static FILE *my_fdopen(int fd, const char *mode) {
         if (kind > 0) {
             /* This fd points to a filterable /proc file.
              * Create a memfd with filtered content and use that instead. */
-            char fdpath[64];
+            char fdpath[32];
             char link[PATH_MAX];
-            snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", fd);
+            /* v5.8h: Manual format instead of snprintf for consistency */
+            const char prefix[] = "/proc/self/fd/";
+            int plen = sizeof(prefix) - 1;
+            memcpy(fdpath, prefix, plen);
+            char numbuf[12];
+            int nlen = 0;
+            if (fd == 0) { numbuf[nlen++] = '0'; }
+            else { int tmp_fd = fd; while (tmp_fd > 0) { numbuf[nlen++] = '0' + (tmp_fd % 10); tmp_fd /= 10; } }
+            for (int i = 0; i < nlen; ++i) fdpath[plen + i] = numbuf[nlen - 1 - i];
+            fdpath[plen + nlen] = '\0';
             ssize_t n = real_readlink ? real_readlink(fdpath, link, sizeof(link) - 1) : -1;
             if (n > 0) {
                 link[n] = '\0';
@@ -2128,6 +2157,7 @@ static int my_getdents64(unsigned int fd, struct dirent *dirp, unsigned int coun
     int i = 0;
     while (i < n) {
         struct dirent *de = (struct dirent*)((char*)dirp + i);
+        if (de->d_reclen == 0) break;  /* v5.8h: prevent infinite loop */
         if (!is_hidden_name(de->d_name)) {
             if (w != i) {
                 memmove((char*)dirp + w, (char*)dirp + i, de->d_reclen);
@@ -2146,6 +2176,7 @@ static int my_getdents(unsigned int fd, struct dirent *dirp, unsigned int count)
     int i = 0;
     while (i < n) {
         struct dirent *de = (struct dirent*)((char*)dirp + i);
+        if (de->d_reclen == 0) break;  /* v5.8h: prevent infinite loop */
         if (!is_hidden_name(de->d_name)) {
             if (w != i) {
                 memmove((char*)dirp + w, (char*)dirp + i, de->d_reclen);
@@ -2247,15 +2278,16 @@ static ssize_t my_sendfile(int out_fd, int in_fd, off_t *offset, size_t count) {
     if (g_hidden) {
         int kind = fd_filter_kind(in_fd);
         if (kind > 0) {
-            /* Read into temp buffer, filter, then send */
-            void *buf = malloc(count);
+            /* v5.8h: Cap allocation to 256KB to prevent OOM on huge counts */
+            size_t alloc = count < 262144 ? count : 262144;
+            void *buf = malloc(alloc);
             if (buf) {
                 ssize_t n;
                 if (offset) {
-                    n = real_pread64 ? real_pread64(in_fd, buf, count, *offset) : -1;
+                    n = real_pread64 ? real_pread64(in_fd, buf, alloc, *offset) : -1;
                     if (n > 0) *offset += n;
                 } else {
-                    n = real_read ? real_read(in_fd, buf, count) : -1;
+                    n = real_read ? real_read(in_fd, buf, alloc) : -1;
                 }
                 if (n > 0) {
                     if (kind == 1) filter_text_lines((char*)buf, (size_t)n);
@@ -2972,6 +3004,7 @@ static void su_sigsys_handler(int signum, siginfo_t *info, void *ctx) {
             long w = 0, i = 0;
             while (i < n) {
                 struct dirent *de = (struct dirent*)((char*)dirp + i);
+                if (de->d_reclen == 0) break;  /* v5.8h: prevent infinite loop */
                 if (!is_hidden_name(de->d_name)) {
                     if (w != i) memmove((char*)dirp + w, (char*)dirp + i, de->d_reclen);
                     w += de->d_reclen;
@@ -3229,7 +3262,9 @@ static void do_manual_unmount(void) {
         char *nl = strchr(line, '\n');
         if (nl) *nl = '\0';
         if (*line) {
-            /* Extract mount point (field 5) */
+            /* Extract mount point (field 5, 0-indexed: field 4).
+             * v5.8h: Previous code checked field==4 AFTER the loop, but by
+             * then field was already 5. Save mount_point when we enter field 4. */
             char *p = line;
             int field = 0;
             char *mount_point = nullptr;
@@ -3237,11 +3272,13 @@ static void do_manual_unmount(void) {
                 if (*p == ' ') {
                     field++;
                     while (*p == ' ') p++;
+                    if (field == 4) {
+                        mount_point = p;  /* start of 5th field */
+                    }
                 } else {
                     p++;
                 }
             }
-            if (field == 4) mount_point = p;
             /* Find end of mount point field */
             if (mount_point) {
                 char *mp_end = strchr(mount_point, ' ');
