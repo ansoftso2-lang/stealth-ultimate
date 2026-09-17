@@ -3351,17 +3351,29 @@ public:
             LOGI("skip (root granted) proc=%s", proc);
             return;
         }
-        /* v5.3: Always hook if process needs hiding, regardless of denylist.
-         * The module is loaded by Zygisk into processes on the denylist.
-         * If the app is NOT on the denylist, Zygisk won't even load this module,
-         * so we don't need to check on_denylist here — if we're running, we're in.
-         * However, we call FORCE_DENYLIST_UNMOUNT to ensure Magisk traces are
-         * unmounted even if the process was loaded via a non-standard path. */
+        /* v5.8h3: CRITICAL — Only hide processes that are on the DenyList.
+         * This is how Shamiko works: it stays completely INERT in processes
+         * that are NOT on the denylist.
+         *
+         * Previous comment claimed "if we're running, we're in [denylist]"
+         * — that is WRONG. Zygisk loads this module into EVERY process,
+         * regardless of denylist. The old code then called
+         * process_needs_hidden() which returns true for ~all user apps,
+         * so read/openat/getdents PLT hooks were installed in EVERY app.
+         * Hooking read() in every app process is what made all apps crash.
+         *
+         * Now: if the process is not on the denylist, do NOTHING at all.
+         * No hooks, no mount namespace isolation, no unmount. The module
+         * becomes a no-op, exactly like Shamiko in non-denylisted apps. */
+        if (!on_denylist) {
+            LOGI("not on denylist — INERT proc=%s uid=%d", proc, uid);
+            return;
+        }
         if (!process_needs_hidden(uid, proc)) {
             LOGI("exempt uid=%d proc=%s — no hooks", uid, proc);
             return;
         }
-        LOGI("HOOKING proc=%s uid=%d on_denylist=%d", proc, uid, (int)on_denylist);
+        LOGI("HOOKING proc=%s uid=%d", proc, uid);
         g_hidden = true;
         /* Force unmount Magisk traces in this process */
         api->setOption(zygisk::Option::FORCE_DENYLIST_UNMOUNT);
